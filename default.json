@@ -1,0 +1,10 @@
+{
+    "index": 0,
+    "pp-size": 8,
+    "tp-size": 2,
+    "rate": "5gbit",
+    "bit-width": 2,
+    "micro-batches": 32,
+    "max-steps": 200,
+    "seq-len": 256
+}

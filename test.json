@@ -1,0 +1,42 @@
+[
+    {
+        "index": 1,
+        "rate": "1gbit",
+        "bit-width": 2
+    },
+    {
+        "index": 2,
+        "rate": "2gbit",
+        "bit-width": 2
+    },
+    {
+        "index": 3,
+        "rate": "5gbit",
+        "bit-width": 2
+    },
+    {
+        "index": 4,
+        "rate": "10gbit",
+        "bit-width": 2
+    },
+    {
+        "index": 5,
+        "rate": "1gbit",
+        "bit-width": 4
+    },
+    {
+        "index": 6,
+        "rate": "2gbit",
+        "bit-width": 4
+    },
+    {
+        "index": 7,
+        "rate": "5gbit",
+        "bit-width": 4
+    },
+    {
+        "index": 8,
+        "rate": "10gbit",
+        "bit-width": 4
+    }
+]
