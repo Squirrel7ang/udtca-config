@@ -120,6 +120,13 @@ export NCCL_SOCKET_IFNAME
 export NCCL_IB_DISABLE
 # export PYTHONPATH="${{REPO_ROOT}}/polar-sgd/src:${{REPO_ROOT}}/bitscom/python:${{PYTHONPATH:-}}"
 
+export HF_ENDPOINT=https://hf-mirror.com
+export http_proxy="http://10.31.10.20:7892"
+export https_proxy="http://10.31.10.20:7892"
+export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,www.dogapi.cc"
+export no_proxy="$NO_PROXY"
+
+
 torchrun \\
   --nproc_per_node="${{NPROC_PER_NODE}}" \\
   --nnodes="${{NNODES}}" \\
@@ -169,13 +176,14 @@ def ssh_execute(
     setup_cmds: str = None,
 ) -> int:
     if setup_cmds is None:
-        setup_cmds = """ \
-source /root/miniconda3/etc/profile.d/conda.sh && \
-export PATH="/root/miniconda3/bin:$PATH" && \
-unset __conda_setup && \
-source /root/clashctl/scripts/cmd/clashctl.sh && \
-clashon && \
-unset HF_ENDPOINT"""
+        setup_cmds = (
+            "source /root/miniconda3/etc/profile.d/conda.sh && "
+            "export PATH='/root/miniconda3/bin:$PATH' && "
+            "unset __conda_setup && "
+            "conda activate tangruijing && "
+            "source /root/clashctl/scripts/cmd/clashctl.sh && "
+            "clashon && unset HF_ENDPOINT"
+        )
     full_cmd = f"ssh {host} 'cd {base_dir} && {setup_cmds} && {cmd}'"
     print(f"Executing (SSH): {full_cmd}")
     result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True)
@@ -233,7 +241,13 @@ def run_experiment(config: Dict[str, Any]) -> None:
     ssh_execute(f"{remote_qwen_dir}/{tc_script_path.name} start", setup_cmds="")
 
     print("\n6. Executing node 0 script locally...")
-    execute_command(str(script_0_path), cwd=QWEN_DIR)
+    conda_cmd = (
+        "source /root/miniconda3/etc/profile.d/conda.sh && "
+        "export PATH='/root/miniconda3/bin:$PATH' && "
+        "unset __conda_setup && "
+        f"conda activate tangruijing && {script_0_path}"
+    )
+    execute_command(conda_cmd, cwd=QWEN_DIR)
 
     print("\n7. Executing node 1 script via SSH...")
     remote_script_1 = f"{remote_qwen_dir}/{script_1_path.name}"
@@ -257,7 +271,14 @@ def run_experiment(config: Dict[str, Any]) -> None:
 
     print("\n10. Moving scripts to script_log directory [REMOTE]...")
     remote_log_dir = f"{remote_base_dir}/script_log/exp{index}_{timestamp}"
-    ssh_execute(f"mkdir -p {remote_log_dir} && mv {remote_qwen_dir}/{script_0_path.name} {remote_qwen_dir}/{script_1_path.name} {remote_qwen_dir}/{tc_script_path.name} {remote_log_dir}/", setup_cmds="")
+    mv_cmd = (
+        f"mkdir -p {remote_log_dir} && "
+        f"mv {remote_qwen_dir}/{script_0_path.name} "
+        f"{remote_qwen_dir}/{script_1_path.name} "
+        f"{remote_qwen_dir}/{tc_script_path.name} "
+        f"{remote_log_dir}/"
+    )
+    ssh_execute(mv_cmd, setup_cmds="")
     print(f"   Moved to: {remote_log_dir}")
 
     print(f"\nExperiment {index} completed!")
