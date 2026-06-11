@@ -5,6 +5,6 @@
     "rate": "5gbit",
     "bit-width": 2,
     "micro-batches": 32,
-    "max-steps": 200,
+    "max-steps": 5,
     "seq-len": 256
 }
