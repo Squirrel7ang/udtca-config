@@ -3,6 +3,8 @@ import os
 import json
 import subprocess
 import shutil
+import signal
+import sys
 from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
@@ -11,6 +13,72 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 QWEN_DIR = SCRIPT_DIR / "experiments" / "qwen14b"
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "default.json"
 TEST_CONFIG_PATH = SCRIPT_DIR / "test.json"
+
+LOCAL_PROCESS = None
+CURRENT_EXP_INFO = None
+QUIET_SSH = True  # 设置为 True 可屏蔽 SSH 远程输出
+
+
+def cleanup_and_exit(signum, frame):
+    global LOCAL_PROCESS, CURRENT_EXP_INFO
+    print(f"\n\nReceived signal {signum}, cleaning up...")
+    
+    if LOCAL_PROCESS is not None:
+        print("Killing local process...")
+        try:
+            LOCAL_PROCESS.terminate()
+        except Exception as e:
+            print(f"Failed to terminate local process: {e}")
+        try:
+            LOCAL_PROCESS.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            print("Force killing local process...")
+            try:
+                LOCAL_PROCESS.kill()
+                LOCAL_PROCESS.wait(timeout=2)
+            except Exception as e:
+                print(f"Failed to kill local process: {e}")
+    
+    if CURRENT_EXP_INFO is not None:
+        print("Moving scripts to script_log directory...")
+        index, timestamp, script_0_path, script_1_path, tc_script_path, remote_qwen_dir, remote_base_dir = CURRENT_EXP_INFO
+        
+        script_log_dir = SCRIPT_DIR / "script_log"
+        script_log_dir.mkdir(exist_ok=True)
+        exp_log_dir = script_log_dir / f"exp{index}_{timestamp}"
+        exp_log_dir.mkdir(exist_ok=True)
+        try:
+            if script_0_path.exists():
+                shutil.move(str(script_0_path), exp_log_dir / script_0_path.name)
+            if script_1_path.exists():
+                shutil.move(str(script_1_path), exp_log_dir / script_1_path.name)
+            if tc_script_path.exists():
+                shutil.move(str(tc_script_path), exp_log_dir / tc_script_path.name)
+            print(f"   [LOCAL] Moved to: {exp_log_dir}")
+        except Exception as e:
+            print(f"Failed to move local scripts: {e}")
+        
+        remote_log_dir = f"{remote_base_dir}/script_log/exp{index}_{timestamp}"
+        mv_cmd = (
+            f"mkdir -p {remote_log_dir} && "
+            f"mv {remote_qwen_dir}/{script_0_path.name} "
+            f"{remote_qwen_dir}/{script_1_path.name} "
+            f"{remote_qwen_dir}/{tc_script_path.name} "
+            f"{remote_log_dir}/"
+        )
+        try:
+            ssh_cmd = f"ssh root@10.31.10.62 '/bin/bash -c \"cd {remote_base_dir} && {mv_cmd}\"'"
+            subprocess.run(ssh_cmd, shell=True, capture_output=True)
+            print(f"   [REMOTE] Moved to: {remote_log_dir}")
+        except Exception as e:
+            print(f"Failed to move remote scripts: {e}")
+    
+    print("Cleanup complete, exiting...")
+    sys.exit(1)
+
+
+signal.signal(signal.SIGINT, cleanup_and_exit)
+signal.signal(signal.SIGTERM, cleanup_and_exit)
 
 
 def load_json(path: Path) -> Any:
@@ -159,14 +227,20 @@ torchrun \\
     output_path.chmod(0o755)
 
 
-def execute_command(cmd: str, cwd: Optional[Path] = None) -> int:
-    print(f"Executing: {cmd}")
-    result = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True)
-    if result.stdout:
-        print(f"[local] STDOUT: {result.stdout}")
-    if result.stderr:
-        print(f"[local] STDERR: {result.stderr}")
-    return result.returncode
+def execute_command(cmd: str, cwd: Optional[Path] = None, background: bool = False) -> subprocess.Popen:
+    bash_cmd = f"/bin/bash -c '{cmd}'"
+    print(f"[LOCAL 210] Executing: {bash_cmd}")
+    process = subprocess.Popen(bash_cmd, shell=True, cwd=cwd)
+    if not background:
+        process.wait()
+        stdout, stderr = process.communicate()
+        if stdout:
+            for line in stdout.decode('utf-8').splitlines():
+                print(f"[LOCAL 210] {line}")
+        if stderr:
+            for line in stderr.decode('utf-8').splitlines():
+                print(f"[LOCAL 210] {line}")
+    return process
 
 
 def ssh_execute(
@@ -174,9 +248,15 @@ def ssh_execute(
     host: str = "root@10.31.10.62",
     base_dir: str = "/home/tangruijing/udtca",
     setup_cmds: str = None,
-) -> int:
+    background: bool = False,
+) -> subprocess.Popen:
     if setup_cmds is None:
         setup_cmds = (
+            "export PATH=/usr/local/corex/bin:/usr/local/corex/lib64/python3/dist-packages/bin:$PATH && "
+            "export LD_LIBRARY_PATH=/usr/local/corex/lib64 && "
+            "export PATH=/usr/local/corex/bin:$PATH && "
+            "export PYTHONPATH=/usr/local/corex/lib64/python3/dist-package && "
+            "export PATH=/usr/local/corex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && "
             "source /root/miniconda3/etc/profile.d/conda.sh && "
             "export PATH='/root/miniconda3/bin:$PATH' && "
             "unset __conda_setup && "
@@ -184,17 +264,25 @@ def ssh_execute(
             "source /root/clashctl/scripts/cmd/clashctl.sh && "
             "clashon && unset HF_ENDPOINT"
         )
-    full_cmd = f"ssh {host} 'cd {base_dir} && {setup_cmds} && {cmd}'"
-    print(f"Executing (SSH): {full_cmd}")
-    result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True)
-    if result.stdout:
-        print(f"[{host}] STDOUT: {result.stdout}")
-    if result.stderr:
-        print(f"[{host}] STDERR: {result.stderr}")
-    return result.returncode
+    full_cmd = f"ssh {host} '/bin/bash -c \"cd {base_dir} && {setup_cmds} && {cmd}\"'"
+    print(f"[REMOTE 62] Executing: {full_cmd}")
+    process = subprocess.Popen(full_cmd, shell=True)
+    if not background:
+        process.wait()
+        if not QUIET_SSH:
+            stdout, stderr = process.communicate()
+            if stdout:
+                for line in stdout.decode('utf-8').splitlines():
+                    print(f"[REMOTE 62] {line}")
+            if stderr:
+                for line in stderr.decode('utf-8').splitlines():
+                    print(f"[REMOTE 62] {line}")
+    return process
 
 
 def run_experiment(config: Dict[str, Any]) -> None:
+    global LOCAL_PROCESS, CURRENT_EXP_INFO
+    
     index = config["index"]
     pp_size = config["pp-size"]
     tp_size = config["tp-size"]
@@ -207,6 +295,8 @@ def run_experiment(config: Dict[str, Any]) -> None:
     remote_host = "root@10.31.10.62"
     remote_base_dir = "/home/tangruijing/udtca"
     remote_qwen_dir = f"{remote_base_dir}/experiments/qwen14b"
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     print(f"\n{'='*60}")
     print(f"Running experiment {index}")
@@ -216,6 +306,8 @@ def run_experiment(config: Dict[str, Any]) -> None:
     script_0_path = QWEN_DIR / f"0_train_qwen14b_exp{index}.sh"
     script_1_path = QWEN_DIR / f"1_train_qwen14b_exp{index}.sh"
     tc_script_path = QWEN_DIR / f"traffic_control_exp{index}.sh"
+    
+    CURRENT_EXP_INFO = (index, timestamp, script_0_path, script_1_path, tc_script_path, remote_qwen_dir, remote_base_dir)
 
     print("\n1. Generating training scripts...")
     generate_train_script(script_0_path, 0, pp_size, tp_size, bit_width, micro_batches, max_steps, seq_len)
@@ -228,37 +320,46 @@ def run_experiment(config: Dict[str, Any]) -> None:
     print(f"   Generated: {tc_script_path}")
 
     print("\n3. Syncing scripts to remote host...")
-    execute_command(f"scp {script_0_path} {script_1_path} {tc_script_path} {remote_host}:{remote_qwen_dir}/")
+    execute_command(f"scp {script_0_path} {script_1_path} {tc_script_path} {remote_host}:{remote_qwen_dir}/", cwd=QWEN_DIR)
 
     print("\n4. Stopping existing traffic control [LOCAL]...")
-    execute_command(f"{tc_script_path} stop")
+    execute_command(f"{tc_script_path} stop", cwd=QWEN_DIR)
     print("\n4. Stopping existing traffic control [REMOTE]...")
-    ssh_execute(f"{remote_qwen_dir}/{tc_script_path.name} stop", setup_cmds="")
+    ssh_execute(f"{remote_qwen_dir}/{tc_script_path.name} stop")
 
     print("\n5. Starting traffic control [LOCAL]...")
-    execute_command(f"{tc_script_path} start")
+    execute_command(f"{tc_script_path} start", cwd=QWEN_DIR)
     print("\n5. Starting traffic control [REMOTE]...")
-    ssh_execute(f"{remote_qwen_dir}/{tc_script_path.name} start", setup_cmds="")
+    ssh_execute(f"{remote_qwen_dir}/{tc_script_path.name} start")
 
-    print("\n6. Executing node 0 script locally...")
+    print("\n6. Executing node 0 script locally (background)...")
     conda_cmd = (
+        "export PATH=/usr/local/corex/bin:/usr/local/corex/lib64/python3/dist-packages/bin:$PATH && "
+        "export LD_LIBRARY_PATH=/usr/local/corex/lib64 && "
+        "export PATH=/usr/local/corex/bin:$PATH && "
+        "export PYTHONPATH=/usr/local/corex/lib64/python3/dist-package && "
+        "export PATH=/usr/local/corex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && "
         "source /root/miniconda3/etc/profile.d/conda.sh && "
         "export PATH='/root/miniconda3/bin:$PATH' && "
         "unset __conda_setup && "
-        f"conda activate tangruijing && {script_0_path}"
+        f"conda activate tangruijing && bash {script_0_path}"
     )
-    execute_command(conda_cmd, cwd=QWEN_DIR)
+    LOCAL_PROCESS = execute_command(conda_cmd, cwd=QWEN_DIR, background=True)
 
     print("\n7. Executing node 1 script via SSH...")
     remote_script_1 = f"{remote_qwen_dir}/{script_1_path.name}"
-    ssh_execute(f"{remote_script_1}")
+    ssh_execute(f"bash {remote_script_1}")
 
-    print("\n8. Stopping traffic control [LOCAL]...")
+    print("\n8. Waiting for training to complete...")
+    print("   Waiting for local node 0...")
+    LOCAL_PROCESS.wait()
+
+    print("\n9. Stopping traffic control [LOCAL]...")
     execute_command(f"{tc_script_path} stop")
-    print("\n8. Stopping traffic control [REMOTE]...")
-    ssh_execute(f"{remote_qwen_dir}/{tc_script_path.name} stop", setup_cmds="")
+    print("\n9. Stopping traffic control [REMOTE]...")
+    ssh_execute(f"{remote_qwen_dir}/{tc_script_path.name} stop")
 
-    print("\n9. Moving scripts to script_log directory [LOCAL]...")
+    print("\n10. Moving scripts to script_log directory [LOCAL]...")
     script_log_dir = SCRIPT_DIR / "script_log"
     script_log_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -269,7 +370,7 @@ def run_experiment(config: Dict[str, Any]) -> None:
     shutil.move(str(tc_script_path), exp_log_dir / tc_script_path.name)
     print(f"   Moved to: {exp_log_dir}")
 
-    print("\n10. Moving scripts to script_log directory [REMOTE]...")
+    print("\n11. Moving scripts to script_log directory [REMOTE]...")
     remote_log_dir = f"{remote_base_dir}/script_log/exp{index}_{timestamp}"
     mv_cmd = (
         f"mkdir -p {remote_log_dir} && "
@@ -278,8 +379,11 @@ def run_experiment(config: Dict[str, Any]) -> None:
         f"{remote_qwen_dir}/{tc_script_path.name} "
         f"{remote_log_dir}/"
     )
-    ssh_execute(mv_cmd, setup_cmds="")
+    ssh_execute(mv_cmd)
     print(f"   Moved to: {remote_log_dir}")
+    
+    LOCAL_PROCESS = None
+    CURRENT_EXP_INFO = None
 
     print(f"\nExperiment {index} completed!")
 
