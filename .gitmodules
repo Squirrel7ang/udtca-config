@@ -1,0 +1,4 @@
+[submodule "polar-sgd"]
+	path = polar-sgd
+	url = git@github.com:Aerithy/polar-sgd.git
+	branch = refactor

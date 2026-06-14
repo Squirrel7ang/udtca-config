@@ -38,5 +38,37 @@
         "index": 8,
         "rate": "10gbit",
         "bit-width": 4
+    },
+    {
+        "index": 9,
+        "baseline": "True",
+        "rate": "1gbit"
+    },
+    {
+        "index": 10,
+        "baseline": "True",
+        "rate": "2gbit"
+    },
+    {
+        "index": 11,
+        "baseline": "True",
+        "rate": "5gbit"
+    },
+    {
+        "index": 12,
+        "baseline": "True",
+        "rate": "10gbit"
+    },
+    {
+        "index": 13,
+        "rate": "10gbit",
+        "bit-width": 2,
+        "max-steps": 200
+    },
+    {
+        "index": 14,
+        "rate": "10gbit",
+        "bit-width": 4,
+        "max-steps": 200
     }
 ]

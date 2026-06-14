@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
+import time
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 QWEN_DIR = SCRIPT_DIR / "experiments" / "qwen14b"
@@ -17,6 +18,7 @@ TEST_CONFIG_PATH = SCRIPT_DIR / "test.json"
 LOCAL_PROCESS = None
 CURRENT_EXP_INFO = None
 QUIET_SSH = True  # 设置为 True 可屏蔽 SSH 远程输出
+CMD_DELAY_SECONDS = 3  # 每条命令执行完后的等待时间（秒）
 
 
 def cleanup_and_exit(signum, frame):
@@ -167,6 +169,19 @@ def generate_train_script(
 ) -> None:
     inflight_buckets = 4 if node_rank == 0 else 1
     
+    hf_endpoint_node0 = """ \
+unset http_proxy && \
+unset HTTP_PROXY && \
+unset https_proxy && \
+unset HTTPS_PROXY && \
+unset NO_PROXY && \
+unset no_proxy && \
+export HF_ENDPOINT=https://hf-mirror.com \
+"""
+
+    hf_endpoint_node1 = """unset HF_ENDPOINT"""
+    hf_endpoint = hf_endpoint_node0 if node_rank == 0 else hf_endpoint_node1
+
     script_content = f"""\
 #!/usr/bin/env bash
 set -euo pipefail
@@ -188,12 +203,9 @@ export NCCL_SOCKET_IFNAME
 export NCCL_IB_DISABLE
 # export PYTHONPATH="${{REPO_ROOT}}/polar-sgd/src:${{REPO_ROOT}}/bitscom/python:${{PYTHONPATH:-}}"
 
-export HF_ENDPOINT=https://hf-mirror.com
-export http_proxy="http://10.31.10.20:7892"
-export https_proxy="http://10.31.10.20:7892"
-export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,www.dogapi.cc"
-export no_proxy="$NO_PROXY"
+{hf_endpoint}
 
+echo "`which torchrun` returns $(which torchrun)"
 
 torchrun \\
   --nproc_per_node="${{NPROC_PER_NODE}}" \\
@@ -208,7 +220,7 @@ torchrun \\
   --micro-batches {micro_batches} \\
   --comm-timing 8 \\
   --max-steps {max_steps} \\
-  --per-device-batch-size 32 \\
+  --per-device-batch-size {micro_batches} \\
   --seq-len {seq_len} \\
   --lr 2e-4 \\
   --dataset-name-or-path HuggingFaceFW/fineweb \\
@@ -219,7 +231,8 @@ torchrun \\
   --polar-bucket-numel 64000000 \\
   --polar-max-inflight-buckets {inflight_buckets} \\
   --method bitscom \\
-  --bitwidth {bit_width}
+  --bitwidth {bit_width} \\
+  --disable-profiler true
 """
     
     with open(output_path, "w") as f:
@@ -240,6 +253,7 @@ def execute_command(cmd: str, cwd: Optional[Path] = None, background: bool = Fal
         if stderr:
             for line in stderr.decode('utf-8').splitlines():
                 print(f"[LOCAL 210] {line}")
+        time.sleep(CMD_DELAY_SECONDS)
     return process
 
 
@@ -266,7 +280,7 @@ def ssh_execute(
         )
     full_cmd = f"ssh {host} '/bin/bash -c \"cd {base_dir} && {setup_cmds} && {cmd}\"'"
     print(f"[REMOTE 62] Executing: {full_cmd}")
-    process = subprocess.Popen(full_cmd, shell=True)
+    process = subprocess.Popen(full_cmd, shell=True, start_new_session=True)
     if not background:
         process.wait()
         if not QUIET_SSH:
@@ -342,7 +356,10 @@ def run_experiment(config: Dict[str, Any]) -> None:
         "source /root/miniconda3/etc/profile.d/conda.sh && "
         "export PATH='/root/miniconda3/bin:$PATH' && "
         "unset __conda_setup && "
-        f"conda activate tangruijing && bash {script_0_path}"
+        "conda deactivate && "
+        "conda activate tangruijing && "
+        "bash -c \"which torchrun\" && "
+        f"bash {script_0_path}"
     )
     LOCAL_PROCESS = execute_command(conda_cmd, cwd=QWEN_DIR, background=True)
 
