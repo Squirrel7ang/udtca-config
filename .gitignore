@@ -1,0 +1,11 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 运行产物
+log/
+script_log/
+runtime_log/
+debug_logs/
+*.log
