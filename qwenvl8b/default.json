@@ -1,0 +1,14 @@
+{
+    "baseline": "False",
+    "index": 0,
+    "pp-size": 8,
+    "tp-size": 1,
+    "rate": "5gbit",
+    "bit-width": 2,
+    "micro-batches": 8,
+    "max-steps": 20,
+    "seq-len": 256,
+    "images-per-sample": 1,
+    "image-grid-h": 4,
+    "image-grid-w": 4
+}

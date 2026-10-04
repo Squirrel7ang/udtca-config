@@ -15,15 +15,20 @@ import sys
 import time
 from collections import OrderedDict
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-# 这个目录是仓库根下的 udtca-config/，训练代码在仓库根下的 experiments/qwen14b/。
-SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
-QWEN_DIR = REPO_ROOT / "experiments" / "qwen14b"
-DEFAULT_CONFIG_PATH = SCRIPT_DIR / "default.json"
-TEST_CONFIG_PATH = SCRIPT_DIR / "test.json"
+# 目录约定：
+#   <repo>/udtca-config/              本目录（CONFIG_ROOT）
+#   <repo>/udtca-config/common/       公共库（COMMON_DIR，这个文件所在处）
+#   <repo>/udtca-config/<exp>/        每个实验自己的 default.json / test.json / 编排脚本
+#   <repo>/udtca-config/utils/        与具体实验无关的辅助脚本
+#   <repo>/experiments/<exp>/         训练代码
+COMMON_DIR = Path(__file__).resolve().parent
+CONFIG_ROOT = COMMON_DIR.parent
+REPO_ROOT = CONFIG_ROOT.parent
+UTILS_DIR = CONFIG_ROOT / "utils"
 
 # 本机是 u62 (10.31.10.62)，节点 0 在本地跑；节点 1 通过 ssh 别名 u210 在远程跑。
 LOCAL_HOST = "62"
@@ -31,9 +36,63 @@ LOCAL_IP = "10.31.10.62"
 REMOTE_HOST = "u210"  # ~/.ssh/config 里的别名，等价于 root@10.31.10.210
 REMOTE_IP = "10.31.10.210"
 REMOTE_BASE_DIR = "/data1/tangruijing/udtca"
-REMOTE_QWEN_DIR = f"{REMOTE_BASE_DIR}/experiments/qwen14b"
 CONDA_ENV = "trj-test"
 HF_ENDPOINT = "https://hf-mirror.com"
+
+
+@dataclass(frozen=True)
+class ExperimentSpec:
+    """一个实验在编排器眼里要交代的全部信息。
+
+    各实验目录里的 generate_and_run*.py 在 main() 开头调 use_experiment() 绑定自己的
+    spec，下面那几个模块级路径常量就会被重绑，其余逻辑完全共用。
+    """
+
+    name: str                    # "qwen14b" / "qwenvl8b"
+    experiment_dir: Path         # <repo>/experiments/<name>
+    entry_script: str            # 训练入口文件名
+    config_dir: Path             # <repo>/udtca-config/<name>
+    remote_experiment_dir: str   # u210 上的对应目录
+    master_port: str = "29500"   # 生成的启动脚本里 MASTER_PORT 的默认值
+
+    @property
+    def entrypoint(self) -> Path:
+        return self.experiment_dir / self.entry_script
+
+    @property
+    def default_config_path(self) -> Path:
+        return self.config_dir / "default.json"
+
+    @property
+    def test_config_path(self) -> Path:
+        return self.config_dir / "test.json"
+
+
+SPEC: Optional[ExperimentSpec] = None
+
+# 默认按 qwen14b 绑定，保证老用法（直接 import 本模块）行为不变；
+# 其它实验在 main() 里调 use_experiment() 覆盖。
+QWEN_DIR = REPO_ROOT / "experiments" / "qwen14b"
+DEFAULT_CONFIG_PATH = CONFIG_ROOT / "qwen14b" / "default.json"
+TEST_CONFIG_PATH = CONFIG_ROOT / "qwen14b" / "test.json"
+REMOTE_QWEN_DIR = f"{REMOTE_BASE_DIR}/experiments/qwen14b"
+
+
+def use_experiment(spec: ExperimentSpec) -> ExperimentSpec:
+    """绑定当前实验，重绑下面前缀为 QWEN_ 的路径常量。
+
+    注意要在用到这些常量的代码之前调用；`from case_common import QWEN_DIR` 这种写法
+    拿的是导入那一刻的值，所以调用方一律用 `case_common.QWEN_DIR` 形式访问。
+    """
+    global SPEC, QWEN_DIR, DEFAULT_CONFIG_PATH, TEST_CONFIG_PATH, REMOTE_QWEN_DIR
+    global ENTRYPOINT
+    SPEC = spec
+    QWEN_DIR = spec.experiment_dir
+    DEFAULT_CONFIG_PATH = spec.default_config_path
+    TEST_CONFIG_PATH = spec.test_config_path
+    REMOTE_QWEN_DIR = spec.remote_experiment_dir
+    ENTRYPOINT = spec.entrypoint
+    return spec
 
 # 本地和远程共用的运行时环境准备，四步：
 #   1) 跑一遍机器自己的 shell 初始化
@@ -146,7 +205,7 @@ def set_runtime_log_enabled(value: bool) -> None:
     global RUNTIME_LOG_ENABLED
     RUNTIME_LOG_ENABLED = bool(value)
 
-sys.path.insert(0, str(SCRIPT_DIR))
+sys.path.insert(0, str(UTILS_DIR))
 from collect_case_logs import collect as collect_case_logs  # noqa: E402
 
 
