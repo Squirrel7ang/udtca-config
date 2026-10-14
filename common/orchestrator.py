@@ -27,12 +27,14 @@ from case_common import (
     REMOTE_HOST,
     SETUP_CMDS,
     allocate_case,
+    bytes_to_gb,
     check_gpus_free,
     execute_command,
     finalize_process_log,
     finish_case,
     fetch_remote_text,
     generate_traffic_control_script,
+    inter_node_tx_bytes,
     is_baseline,
     kill_local_training,
     kill_remote_training,
@@ -41,6 +43,7 @@ from case_common import (
     parse_only,
     parse_launch_params,
     parse_launch_params_text,
+    remote_rm,
     runtime_log_enabled,
     set_runtime_log_enabled,
     ssh_execute,
@@ -100,6 +103,59 @@ def install_signal_handlers(spec: ExperimentSpec) -> None:
     handler = lambda signum, frame: cleanup_and_exit(signum, frame, spec)  # noqa: E731
     signal.signal(signal.SIGINT, handler)
     signal.signal(signal.SIGTERM, handler)
+
+
+# ---------------------------------------------------------------- 通信量采样
+
+
+def _snapshot_tx_bytes() -> "Optional[int]":
+    """抓一下两机链路上的累计发送字节（用于训练窗口前后做差）。
+
+    读的是网卡总流量（含 ssh 等），但训练期间这些杂项只有几 KB，可忽略。
+    """
+    total = inter_node_tx_bytes()
+    if total is None:
+        print("   [警告] 读不到网卡计数器（ens1f0），本次通信量无法测量")
+    return total
+
+
+def _volume_between(start_bytes, end_bytes):
+    """返回 (字节数, GB)；任一端没读到就返回 (None, None)。"""
+    if start_bytes is None or end_bytes is None:
+        return None, None
+    total = max(0, int(end_bytes) - int(start_bytes))
+    return total, bytes_to_gb(total)
+
+
+def _report_comm_volume(record, vol_bytes, vol_gb) -> None:
+    """打印并把通信量写进 case 记录。"""
+    if vol_gb is None:
+        print("   Comm volume: 未测得（网卡计数器读取失败）")
+        return
+    print(f"   Comm volume (training window): {vol_gb:.3f} GB "
+          f"({vol_bytes} bytes, 1GB=1e9B)")
+    if record is not None:
+        record["comm_bytes"] = vol_bytes
+        record["comm_gb"] = vol_gb
+
+
+# ---------------------------------------------------------------- NCCL 字节日志
+#
+# 压缩率的干净口径：让 NCCL 自己报每个集合通信的 payload 字节（count × dtype）。
+# 这是"交给网络的那块 buffer"的大小 —— baseline 是稠密梯度、polar 是 bitscom
+# 打包后的低比特 buffer，天然免疫其他租户流量和 TCP 重传。
+#   * NCCL_DEBUG_SUBSYS=COLL 只记集合通信，日志量可控；
+#   * NCCL_DEBUG_FILE 里的 %h/%p 由 NCCL 展开成主机名/pid，每个 rank 一个文件；
+#   * 训练进程的 cwd 是 case 目录，日志直接落在里面，归档时不用额外搬运。
+
+def _nccl_debug_env(log_dir: "Optional[str]") -> str:
+    """生成开启 NCCL 集合通信日志的环境变量前缀；没有 case 目录就不开。"""
+    if not log_dir:
+        return ""
+    return (
+        "export NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=COLL "
+        f"NCCL_DEBUG_FILE={log_dir}/nccl_%h_%p.log && "
+    )
 
 
 # ---------------------------------------------------------------- 启动脚本渲染
@@ -295,8 +351,12 @@ def run_polar_case(
     node1_log = f"{remote_case_dir}/train_node1.log" if remote_case_dir else None
 
     print("\n6. Executing node 0 script locally (background)...")
+    vol_start = _snapshot_tx_bytes()
+    nccl_env = _nccl_debug_env(str(case_dir) if case_dir else None)
+    nccl_env_remote = _nccl_debug_env(remote_case_dir)
     conda_cmd = (
         f"{SETUP_CMDS} && "
+        f"{nccl_env}"
         "bash -c \"which torchrun\" && "
         f"bash {script_0_path}"
     )
@@ -305,13 +365,18 @@ def run_polar_case(
 
     print("\n7. Executing node 1 script via SSH...")
     remote_script_1 = f"{spec.remote_experiment_dir}/{script_1_path.name}"
-    ssh_execute(f"bash {remote_script_1}", log_path=node1_log)
+    ssh_execute(f"{nccl_env_remote}bash {remote_script_1}", log_path=node1_log)
 
     print("\n8. Waiting for training to complete...")
     print("   Waiting for local node 0...")
     exit_code = LOCAL_PROCESS.wait()
     finalize_process_log(LOCAL_PROCESS)
     print(f"   node 0 exited with code {exit_code}")
+
+    # 训练窗口结束，立刻抓一次；必须在归档 rsync 之前，否则拉日志的流量会混进来
+    vol_end = _snapshot_tx_bytes()
+    vol_bytes, vol_gb = _volume_between(vol_start, vol_end)
+    _report_comm_volume(record, vol_bytes, vol_gb)
 
     print("\n9. Stopping traffic control [LOCAL]...")
     execute_command(f"{tc_script_path} stop")
@@ -324,11 +389,18 @@ def run_polar_case(
             record, cases, case_dir, remote_case_dir,
             # node0 的脚本和限速脚本都是 runner 自己生成的，归集后原地不留
             local_scripts=[(script_0_path, True), (tc_script_path, True)],
-            # node1 实际跑的是 u210 上那份，必须从远程拉；拉完清掉远程的临时副本
+            # node1 实际跑的是 u210 上那份，必须从远程拉；拉完清掉远程的临时副本，
+            # 本地那份是 runner 生成后 scp 过去的重复副本，也一并删掉（内容已在 case 目录里）
             remote_scripts=[(script_1_path.name,
-                             f"{spec.remote_experiment_dir}/{script_1_path.name}", True)],
+                             f"{spec.remote_experiment_dir}/{script_1_path.name}", True,
+                             script_1_path)],
             exit_code=exit_code,
         )
+        # node0 脚本和限速脚本当初也 scp 了一份到 u210，node1 那份 finish_case 已删；
+        # 这两份在 u210 上没人用，内容又都已归集到 case 目录，一并清掉
+        print("   Cleaning up generated scripts on remote...")
+        remote_rm(f"{spec.remote_experiment_dir}/{script_0_path.name}")
+        remote_rm(f"{spec.remote_experiment_dir}/{tc_script_path.name}")
     else:
         print("\n10. runtime_log 已关闭，跳过脚本与日志归档")
 
@@ -458,8 +530,12 @@ def run_baseline_case(
     node1_log = f"{remote_case_dir}/train_node1.log" if remote_case_dir else None
 
     print(f"\n5. Executing local script ({script_name_0})...")
+    vol_start = _snapshot_tx_bytes()
+    nccl_env = _nccl_debug_env(str(case_dir) if case_dir else None)
+    nccl_env_remote = _nccl_debug_env(remote_case_dir)
     conda_cmd = (
         f"{SETUP_CMDS} && "
+        f"{nccl_env}"
         f"{max_steps_env}"
         "bash -c \"which torchrun\" && "
         f"bash {script_path_0}"
@@ -472,10 +548,10 @@ def run_baseline_case(
     if remote_case_dir:
         remote_cmd = (
             f"mkdir -p {remote_case_dir} && cd {remote_case_dir} && "
-            f"{max_steps_env}bash {remote_script}"
+            f"{nccl_env_remote}{max_steps_env}bash {remote_script}"
         )
     else:
-        remote_cmd = f"{max_steps_env}bash {remote_script}"
+        remote_cmd = f"{nccl_env_remote}{max_steps_env}bash {remote_script}"
     ssh_execute(remote_cmd, background=True, log_path=node1_log)
 
     print("\n7. Waiting for local process to complete...")
@@ -483,6 +559,11 @@ def run_baseline_case(
     finalize_process_log(LOCAL_PROCESS)
     if exit_code != 0:
         print(f"[WARNING] Local process exited with code {exit_code}")
+
+    # 训练窗口结束，立刻抓一次；必须在归档 rsync 之前
+    vol_end = _snapshot_tx_bytes()
+    vol_bytes, vol_gb = _volume_between(vol_start, vol_end)
+    _report_comm_volume(record, vol_bytes, vol_gb)
 
     print("\n8. Stopping traffic control [LOCAL]...")
     execute_command(f"bash {tc_script_path} stop", cwd=spec.experiment_dir)
@@ -497,11 +578,16 @@ def run_baseline_case(
             # 限速脚本是 runner 自己生成的，归集后原地不留
             local_scripts=[(script_path_0, False), (tc_script_path, True)],
             # node1 跑的是 u210 上那份，和本地同名文件内容可能不同，必须从远程拉；
-            # 它同样是仓库文件，远程那份也保留
+            # 它同样是仓库文件，远程那份也保留。本地那份也是受版本管理的仓库文件，
+            # 不是 runner 生成的副本，不能删，所以没有本地副本可清（第 4 项传 None）
             remote_scripts=[(script_name_1,
-                             f"{spec.remote_experiment_dir}/{script_name_1}", False)],
+                             f"{spec.remote_experiment_dir}/{script_name_1}", False, None)],
             exit_code=exit_code,
         )
+        # 限速脚本当初也 scp 了一份到 u210，归集完就没用了，顺手清掉；
+        # baseline 的训练脚本是仓库文件，两边都保留
+        print("   Cleaning up generated scripts on remote...")
+        remote_rm(f"{spec.remote_experiment_dir}/{tc_script_path.name}")
     else:
         print("\n9. runtime_log 已关闭，跳过脚本与日志归档")
 
@@ -527,6 +613,13 @@ def make_arg_parser(description: str) -> argparse.ArgumentParser:
         "--only",
         default=None,
         help="只跑指定 index，逗号分隔，例如 --only 1,2,9；不填则跑 test.json 里全部",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="临时覆盖 default.json/test.json 的 max-steps。做冒烟/短测时用，"
+             "不传则用配置里的值。",
     )
     return parser
 
@@ -571,6 +664,8 @@ def run_experiments(
     if only is not None:
         test_configs = [c for c in test_configs if c.get("index") in only]
         print(f"只跑 index {sorted(only)}")
+    if getattr(args, "max_steps", None) is not None:
+        print(f"覆盖 max-steps = {args.max_steps}")
     print(f"Found {len(test_configs)} test configurations")
 
     for i, test_config in enumerate(test_configs):
@@ -579,6 +674,9 @@ def run_experiments(
         print(f"Raw config: {test_config}")
 
         merged_config = merge_config(default_config, test_config)
+        if getattr(args, "max_steps", None) is not None:
+            # 命令行覆盖优先于 default.json / test.json
+            merged_config["max-steps"] = int(args.max_steps)
         if is_baseline(test_config, default_config):
             if baseline_scripts is None:
                 raise SystemExit(

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """udtca Qwen 实验编排的公共部分。
 
-generate_and_run.py（POLAR / bitscom）和 generate_and_run_baseline.py（baseline）
+generate_and_run.py（主编排入口，POLAR / bitscom 与 baseline 都在这里）
+和各实验目录下的 _run_baseline.py（内部脚本，只跑 baseline）
 共用这里的常量、两节点命令封装、case 编号与 case.json 读写、日志收集。
 """
 
@@ -444,6 +445,136 @@ def remote_rm(remote_path: str) -> None:
         print(f"   [警告] 删除远程文件失败 {remote_path}: {e}")
 
 
+# ---------------------------------------------------------------- 通信量（网卡字节数）
+
+# 两机之间的互联网卡，和 NCCL_SOCKET_IFNAME / tc 脚本用的是同一个
+NIC_IFACE = "ens1f0"
+
+
+def read_nic_bytes_local(iface: str = NIC_IFACE):
+    """本机网卡的累计 (rx_bytes, tx_bytes)；读不到返回 None。"""
+    base = f"/sys/class/net/{iface}/statistics"
+    try:
+        with open(f"{base}/rx_bytes") as f:
+            rx = int(f.read().strip())
+        with open(f"{base}/tx_bytes") as f:
+            tx = int(f.read().strip())
+        return rx, tx
+    except OSError:
+        return None
+
+
+def read_nic_bytes_remote(iface: str = NIC_IFACE):
+    """u210 上网卡的累计 (rx_bytes, tx_bytes)；读不到返回 None。"""
+    cmd = (
+        f"ssh {REMOTE_HOST} 'cat /sys/class/net/{iface}/statistics/rx_bytes; "
+        f"cat /sys/class/net/{iface}/statistics/tx_bytes'"
+    )
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True,
+                                text=True, timeout=30)
+        lines = [ln.strip() for ln in result.stdout.splitlines() if ln.strip().isdigit()]
+        if len(lines) < 2:
+            return None
+        return int(lines[0]), int(lines[1])
+    except Exception:
+        return None
+
+
+def inter_node_tx_bytes(iface: str = NIC_IFACE):
+    """两机间链路上累计"已发送"的字节数（node0 的 tx + node1 的 tx）。
+
+    同一批包，node0 的 tx 就是 node1 的 rx，反之亦然。把两个节点的 tx 相加，
+    正好把两个方向各数一次，不会像 (rx+tx) 那样重复计数。任一侧读不到就返回 None。
+    """
+    local = read_nic_bytes_local(iface)
+    remote = read_nic_bytes_remote(iface)
+    if local is None or remote is None:
+        return None
+    return local[1] + remote[1]
+
+
+def bytes_to_gb(num_bytes: float) -> float:
+    """字节转 GB（1 GB = 10^9 Byte，大写 B）。"""
+    return float(num_bytes) / 1e9
+
+
+# ---- 按对端 IP 过滤的字节计数 -------------------------------------------------
+#
+# 这台机器是 k8s 节点，ens1f0 上还跑着别的租户的 pod，光看网卡总字节会被别人的
+# 流量污染。这里用 iptables mangle 表插一条"发给对端 IP"的计数规则，只统计两机
+# 之间的流量。
+#   * 用 mangle 表是因为 Calico 只重写 filter/nat，mangle 不会被它反复重建；
+#   * -w 10 是必须的：k8s 节点上 xtables 锁经常被 Calico 占着；
+#   * 规则带固定注释，启动时先清残留（进程被外部杀掉时规则可能没来得及删）。
+
+_PEER_RULE_COMMENT = "udtca_peer_tx"
+
+
+def _iptables(remote: bool, args: str, timeout: int = 25) -> str:
+    cmd = f"iptables -w 10 {args}"
+    if remote:
+        cmd = f"ssh {REMOTE_HOST} '{cmd}'"
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                              timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def _peer_rule_args(peer_ip: str, action: str) -> str:
+    """action 形如 '-I OUTPUT 1'（插入）或 '-D OUTPUT'（删除）。"""
+    return (f"-t mangle {action} -d {peer_ip} "
+            f"-m comment --comment {_PEER_RULE_COMMENT} -j RETURN")
+
+
+def _delete_peer_rules(remote: bool, peer_ip: str) -> None:
+    for _ in range(4):
+        if _PEER_RULE_COMMENT not in _iptables(remote, "-t mangle -S OUTPUT"):
+            break
+        _iptables(remote, _peer_rule_args(peer_ip, "-D OUTPUT"))
+
+
+def start_peer_counters() -> bool:
+    """在两节点各插一条计数规则（先清残留，计数从 0 开始）。失败返回 False。"""
+    try:
+        _delete_peer_rules(False, REMOTE_IP)
+        _iptables(False, _peer_rule_args(REMOTE_IP, "-I OUTPUT 1"))
+        _delete_peer_rules(True, LOCAL_IP)
+        _iptables(True, _peer_rule_args(LOCAL_IP, "-I OUTPUT 1"))
+        ok = read_peer_tx_bytes() is not None
+        if not ok:
+            print("   [警告] iptables 计数规则插入后读不到，回退到网卡总字节")
+        return ok
+    except Exception as e:
+        print(f"   [警告] 建立 iptables 计数规则失败: {e}")
+        return False
+
+
+def _read_peer_bytes_one(remote: bool):
+    out = _iptables(remote, "-t mangle -L OUTPUT -n -v -x")
+    for line in out.splitlines():
+        if _PEER_RULE_COMMENT in line:
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                return int(parts[1])
+    return None
+
+
+def read_peer_tx_bytes():
+    """两节点"发给对端"的累计字节之和（每个方向各算一次）；读不到返回 None。"""
+    local = _read_peer_bytes_one(False)
+    remote = _read_peer_bytes_one(True)
+    if local is None or remote is None:
+        return None
+    return local + remote
+
+
+def remove_peer_counters() -> None:
+    _delete_peer_rules(False, REMOTE_IP)
+    _delete_peer_rules(True, LOCAL_IP)
+
+
 def fetch_remote_text(remote_path: str) -> str:
     """读远程节点上的文件内容（只读，失败返回空串）。
 
@@ -826,8 +957,8 @@ def finish_case(record: Dict[str, Any], cases: list, case_dir: Path,
                 exit_code: Optional[int]) -> None:
     """跑完之后收尾：留档两节点各自的启动脚本、拉远程日志、拍平、回写 case.json。
 
-    local_scripts : [(Path, move)]             本机 node0 实际用的文件
-    remote_scripts: [(文件名, 远程路径, move)]  远程 node1 实际用的文件，从远程拉回来
+    local_scripts : [(Path, move)]                    本机 node0 实际用的文件
+    remote_scripts: [(文件名, 远程路径, move, 本地副本)] 远程 node1 实际用的文件，从远程拉回来
 
     move=True 用于 runner 自己生成/下发的一次性脚本（归集后原地不留）；
     move=False 用于仓库里已有的受版本管理的脚本（必须原地保留，移动会让下次跑不了）。
@@ -835,6 +966,11 @@ def finish_case(record: Dict[str, Any], cases: list, case_dir: Path,
 
     node1 的脚本必须从远程拉：node1 跑的是 u210 上那份，本地同名文件可能是改过的旧版
     （baseline 那两份本地/远程内容确实不一样）。
+
+    remote_scripts 的第 4 项「本地副本」：POLAR 路径下 node1 脚本是 runner 本地生成、
+    scp 到远程再跑的，远程那份收进 case 目录后，本地这份就是多余的重复文件，
+    传进来即可一并删掉（内容已归档在 runtime_log/<case>/ 里，丢了也能按 case.json 重生成）。
+    远程拉取失败时不动本地副本，留个兜底。仓库里已有的 baseline 脚本没有这个副本，传 None。
     """
     print(f"\nCollecting logs into {case_dir} ...")
 
@@ -852,11 +988,18 @@ def finish_case(record: Dict[str, Any], cases: list, case_dir: Path,
             print(f"   [警告] 归档 {src.name} 到 case 目录失败: {e}")
 
     print("   Archiving node 1 scripts from remote...")
-    for name, remote_path, move in remote_scripts:
+    for name, remote_path, move, local_mirror in remote_scripts:
         if fetch_remote_file(remote_path, case_dir / name):
             print(f"     {name} (copied from remote)")
             if move:
                 remote_rm(remote_path)
+            # 远程那份已经躺进 case 目录了，本地这份同名副本没有别的用途，清掉
+            if local_mirror is not None:
+                try:
+                    Path(local_mirror).unlink()
+                    print(f"     {Path(local_mirror).name} (removed local copy)")
+                except OSError as e:
+                    print(f"   [警告] 删除本地副本 {local_mirror} 失败: {e}")
 
     print("   Pulling node 1 logs from remote...")
     rsync_cmd = f"rsync -a --ignore-existing {REMOTE_HOST}:{remote_case_dir}/ {case_dir}/"

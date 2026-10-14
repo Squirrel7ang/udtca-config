@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""只跑 test.json 里标记为 baseline 的配置（稠密 DP + 1F1B PP + TP）。
+"""【内部脚本，一般不用直接调用】只跑 qwenvl8b/test.json 里标记为 baseline 的配置（稠密 DP + 1F1B PP）。
 
-训练用的是仓库里现成的 experiments/qwen14b/0|1_train_qwen14b_baseline_ddp_1f1b_tp.sh，
+对外请用 generate_and_run.py —— 它按每条配置的 baseline 标记自动分派，
+POLAR 和 baseline 都会跑到，不需要单独跑这个脚本。
+
+训练用的是仓库里现成的
+experiments/qwenvl8b/0|1_train_qwenvl8b_baseline_ddp_1f1b.sh，
 本脚本只负责生成 traffic_control 脚本、下发、限速、起停、收日志。
 
-和 generate_and_run.py 共用同一套 case 编号与 runtime_log/case.json，
-只是把 POLAR 那条路径过滤掉了。
+和 generate_and_run.py 共用同一套 case 编号与 runtime_log/case.json。
 
-用法：
-    python generate_and_run_baseline.py                    # 跑 test.json 里全部 baseline
-    python generate_and_run_baseline.py --only 2,4         # 只跑指定 index
-    python generate_and_run_baseline.py --runtime-log off  # 冒烟：不归档
+用法（文件名带下划线前缀，表示是内部脚本）：
+    python _run_baseline.py                    # 跑全部 baseline 配置
+    python _run_baseline.py --only 2,4         # 只跑指定 index
+    python _run_baseline.py --runtime-log off  # 冒烟：不归档
 """
 
 import sys
@@ -38,22 +41,21 @@ from orchestrator import (  # noqa: E402
 from generate_and_run import (  # noqa: E402
     BASELINE_RUN_LABEL,
     BASELINE_SCRIPTS,
-    QWEN14B_SPEC,
+    QWENVL8B_SPEC,
 )
 
 
 def main():
     print("=" * 60)
-    print("Baseline Training Runner")
+    print("QwenVL8B Baseline Training Runner")
     print("=" * 60)
 
-    args = make_arg_parser("只跑 test.json 里 baseline 的配置").parse_args()
+    args = make_arg_parser("只跑 qwenvl8b/test.json 里 baseline 的配置").parse_args()
     if args.runtime_log is not None:
         set_runtime_log_enabled(args.runtime_log == "on")
 
-    install_signal_handlers(QWEN14B_SPEC)
+    install_signal_handlers(QWENVL8B_SPEC)
 
-    # 跑之前确认两台机器的卡都没被占用；被占用就报错退出，不等
     if not check_gpus_free():
         print("\nGPU 被占用，本次退出。等卡空出来再重跑。")
         sys.exit(1)
@@ -63,8 +65,8 @@ def main():
     else:
         print("\nruntime_log 已关闭：不写 environment.json / case.json，不归档脚本与日志")
 
-    default_config = load_json(QWEN14B_SPEC.default_config_path)
-    test_configs = load_json(QWEN14B_SPEC.test_config_path)
+    default_config = load_json(QWENVL8B_SPEC.default_config_path)
+    test_configs = load_json(QWENVL8B_SPEC.test_config_path)
     only = parse_only(args.only)
     if only is not None:
         test_configs = [c for c in test_configs if c.get("index") in only]
@@ -85,7 +87,7 @@ def main():
         print(f"  index={config['index']}, rate={config['rate']}, max-steps={config['max-steps']}")
 
     for config in baseline_configs:
-        run_baseline_case(QWEN14B_SPEC, config, BASELINE_SCRIPTS, BASELINE_RUN_LABEL)
+        run_baseline_case(QWENVL8B_SPEC, config, BASELINE_SCRIPTS, BASELINE_RUN_LABEL)
 
     print("\n" + "=" * 60)
     print("All baseline experiments completed!")
