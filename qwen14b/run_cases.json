@@ -1,0 +1,6 @@
+[
+    { "index": 1, "rate": "2gbit", "bit-width": 2, "baseline": "False" },
+    { "index": 2, "rate": "2gbit", "baseline": "True" },
+    { "index": 3, "rate": "1gbit", "bit-width": 2, "baseline": "False" },
+    { "index": 4, "rate": "1gbit", "baseline": "True" }
+]

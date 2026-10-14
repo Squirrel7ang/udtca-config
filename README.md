@@ -15,15 +15,18 @@ udtca-config/
 ├── qwen14b/                 Qwen2.5-14B 实验（PP=8 TP=2 DP=2）
 │   ├── default.json         默认超参，被 test.json 的条目覆盖
 │   ├── test.json            实验矩阵（index / rate / bit-width / baseline）
-│   ├── generate_and_run.py  主入口
-│   └── generate_and_run_baseline.py   只跑 baseline 的入口
+│   ├── generate_and_run.py  主入口（唯一需要直接跑的）
+│   └── _run_baseline.py     内部脚本：只跑 baseline 的入口（一般不用直接调用）
 ├── qwenvl8b/                Qwen3-VL-8B 实验（PP=8 TP=1 DP=4），结构与 qwen14b 一一对应
-│   ├── default.json  test.json  generate_and_run.py  generate_and_run_baseline.py
+│   ├── default.json  test.json  generate_and_run.py  _run_baseline.py
 └── utils/                   与具体实验无关的辅助脚本
     ├── watch_bandwidth.py   实时看两机之间的网卡带宽
     ├── collect_case_logs.py 把深层 ./log/... 拍平成 tb_scalars/tb_trace/step_csv
     ├── trace_processor.py   从 step_csv/tfevent 算每步耗时与吞吐，做 case 间对比
     ├── download_fineweb.py  按顺序把 fineweb 的前缀 parquet 下到本地
+    ├── analyze_overlap.py   从 profiler trace 算计算-通信重叠率（三种口径）
+    ├── overlap_interval.py  从 profiler trace 算 DP 区间与 PP 区间的交并比重叠率
+    ├── parse_nccl_bytes.py  从 NCCL 集合通信日志算通信量，给出压缩比
     └── build_comm_opt_data.py  把实验结果整理成交付目录树并打包
 
 > `run_qwen14b_polar_dp_pp_tp.py` 是 `experiments/qwen14b/` 下同名文件的**旧副本**
@@ -62,10 +65,12 @@ python udtca-config/qwenvl8b/generate_and_run.py         # QwenVL8B 全矩阵
 ```
 
 也可以用环境变量 `UDTCA_RUNTIME_LOG=0`（优先级：命令行 > 环境变量 > 默认 on）。
-只跑 baseline：
+
+只跑 baseline 是 `generate_and_run.py` 的一个子集，一般直接用它加 `--only` 即可，
+不需要单独跑别的脚本。确有需要时再用内部脚本 `_run_baseline.py`：
 
 ```bash
-python udtca-config/qwen14b/generate_and_run_baseline.py
+python udtca-config/qwen14b/_run_baseline.py    # 内部脚本，只跑 test.json 里 baseline 的条目
 ```
 
 每条配置按自己的 `baseline` 字段分派：为真跑仓库里现成的 `0/1_*_baseline_*.sh`，
@@ -90,10 +95,10 @@ qwen14b `micro-batches=32`、qwenvl8b `micro-batches=8`；`--log-interval 10`，
 
 | 脚本 | 作用 | 用法 |
 |---|---|---|
-| `qwen14b/generate_and_run.py` | 主入口，按 `test.json` 分派 polar / baseline | `python .../qwen14b/generate_and_run.py [--only 1,3] [--runtime-log off]` |
-| `qwen14b/generate_and_run_baseline.py` | 只跑 `baseline=True` 的条目，共用同一套 case 编号 | 同上 |
+| `qwen14b/generate_and_run.py` | **唯一对外入口**，按 `test.json` 分派 polar / baseline | `python .../qwen14b/generate_and_run.py [--only 1,3] [--runtime-log off]` |
+| `qwen14b/_run_baseline.py` | 内部脚本：只跑 `baseline=True` 的条目，共用同一套 case 编号 | 一般不用直接调用，`generate_and_run.py --only` 即可 |
 | `qwenvl8b/generate_and_run.py` | QwenVL8B 主入口，行为同上 | 同上 |
-| `qwenvl8b/generate_and_run_baseline.py` | QwenVL8B 只跑 baseline | 同上 |
+| `qwenvl8b/_run_baseline.py` | QwenVL8B 内部脚本：只跑 baseline | 同上 |
 | `common/case_common.py` | 被上面 4 个 import。定义 `ExperimentSpec`、`SETUP_CMDS`（两节点环境对齐）、`ssh_execute`（base64 传远程脚本）、`check_gpus_free`、`allocate_case`、`write_launch_script` 等 | 不单独运行 |
 | `common/orchestrator.py` | 被上面 4 个 import。`run_polar_case` / `run_baseline_case` / `run_experiments`，以及训练脚本模板 `write_train_script` | 不单独运行 |
 | `utils/watch_bandwidth.py` | 读两节点 `ens1f0` 的 rx/tx 计数算实时速率（只读，不干扰训练） | `python utils/watch_bandwidth.py [-i 5] [--once] [--iface ens1f0]` |
@@ -106,20 +111,34 @@ qwen14b `micro-batches=32`、qwenvl8b `micro-batches=8`；`--log-interval 10`，
 
 ```
 runtime_log/
-├── case.json            每个 case 的启动脚本与启动参数
+├── case.json            所有 case 的索引（见下）
 ├── environment.json     机器与网络环境说明（交数据时用）
-└── 0001/
-    ├── launch.sh                      自包含的复现脚本（不依赖 runner）
-    ├── 0_train_<exp>_exp1.sh          node0(u62) 实际跑的
-    ├── 1_train_<exp>_exp1.sh          node1(u210) 实际跑的（从远程拉回）
-    ├── traffic_control_exp1.sh        限速脚本
-    ├── train_node0.log / train_node1.log
-    ├── tb_scalars/  tb_trace/  step_csv/
+└── 0021/                一个 case 一个目录，编号按实际运行顺序递增
+    ├── launch.sh                       自包含的复现脚本（不依赖 runner）
+    ├── 0_train_<exp>_exp1.sh           node0(u62) 实际跑的
+    ├── 1_train_<exp>_exp1.sh           node1(u210) 实际跑的（跑完从远程拉回）
+    ├── traffic_control_exp1.sh         限速脚本（start / stop）
+    ├── train_node0.log                 node0 的完整输出
+    ├── train_node1.log                 node1 的完整输出
+    ├── nccl_<host>_<pid>.log           每个 rank 一份的 NCCL 集合通信日志
+    ├── tb_scalars/                     tensorboard 标量（loss 等）
+    ├── tb_trace/                       每个 rank 一份 profiler trace
+    └── step_csv/                       每步耗时/吞吐的 csv
 ```
 
-`case` 编号按**实际运行顺序**递增，不是 `test.json` 的 index。u210 的输出只写
-`train_node1.log`，不回显终端（两节点的输出交织太乱）；PP 最后一级在 u62 上有副本，
-loss 在终端照样看得到。
+各项说明：
+
+| 项 | 说明 |
+|---|---|
+| `case.json` | 每个 case 一条：编号、`test_index`、`kind`（polar / baseline）、限速、实际下发的启动参数、`exit_code`、以及**训练窗口内两机之间的通信量** `comm_bytes` / `comm_gb`（1GB=1e9B）。 |
+| case 编号 | 按**实际运行顺序**递增，不是 `test.json` 的 index；同一个 index 重跑会拿到新编号。 |
+| `launch.sh` | 把该 case 的下发、限速、起训打包好，两个终端各跑 `bash launch.sh 0` / `bash launch.sh 1` 就能复现，不依赖 runner。 |
+| `*_train_<exp>_exp1.sh` | 实际下发的训练脚本；`0_` 是 u62 的，`1_` 是 u210 的。 |
+| `train_node*.log` | u210 的输出只写 `train_node1.log`、不回显终端（两节点输出交织太乱）；PP 最后一级在 u62 上有副本，loss 在终端照样看得到。 |
+| `nccl_*.log` | 训练时开 `NCCL_DEBUG` 落下来的集合通信日志，每个 rank 一个文件。通信量的另一套口径从这里读（`count × dtype`），对应 `utils/parse_nccl_bytes.py`。 |
+| `tb_trace/` | profiler trace，每个 rank 一份 json。重叠率就是从这里算：取 rank0 那份，对应 `utils/analyze_overlap.py`、`utils/overlap_interval.py`。 |
+
+被中断的 case 目录会留在原地（通常没有 `tb_trace/`），方便事后查为什么没跑完。
 
 手动复现某个 case（两个终端各跑一条）：
 
