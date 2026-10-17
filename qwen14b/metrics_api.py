@@ -516,9 +516,10 @@ class MetricStore:
             self.error = f"{self.run_log_root} 下没有 run_* 目录"
             return
         self.error = None
-        if run_dir != self.run_dir or not self.cases:
-            with self._lock:
-                self._discover_cases()
+        # 每次都重扫 case 目录：4-case 矩阵是一步步新建 0002/0003/0004 的，
+        # 只在首轮发现时必须重扫，否则后面几个 case 永远不可见。
+        with self._lock:
+            self._discover_cases()
 
         for state in list(self.cases.values()):
             # step_csv 会在训练过程中不断增长，mtime 变了才重读
