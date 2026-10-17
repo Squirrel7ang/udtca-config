@@ -243,6 +243,18 @@ def _collect_case(record: Dict[str, Any], default_config: Dict[str, Any]) -> Dic
         tokens = step["num_steps"] * dp_world * per_dev_batch * seq_len
         throughput = tokens / step["total_step_s"]
 
+    # 端到端墙钟：case.json 里记的是启动/收尾时间戳（秒级），
+    # 包含建库、加载模型、编译、运行全部环节，和 total_step_s（只算训练循环）不是一个口径。
+    elapsed_s = None
+    try:
+        fmt = "%Y-%m-%d_%H-%M-%S"
+        t0 = datetime.strptime(record["started_at"], fmt)
+        if record.get("finished_at"):
+            t1 = datetime.strptime(record["finished_at"], fmt)
+            elapsed_s = (t1 - t0).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        elapsed_s = None
+
     # 每步重叠率 / 通信量（polar 才有），取均值
     ov_vals, saved_vals = [], []
     for r in rt:
@@ -267,6 +279,7 @@ def _collect_case(record: Dict[str, Any], default_config: Dict[str, Any]) -> Dic
         "num_steps": step.get("num_steps"),
         "avg_step_s": step.get("avg_step_s"),
         "total_step_s": step.get("total_step_s"),
+        "elapsed_s": elapsed_s,
         "throughput_tok_s": throughput,
         "offline_overlap": overlap.get("overlap"),
         "rt_steps": len(rt),
@@ -301,7 +314,7 @@ def _fmt(v, nd=2):
 
 def _summary_table(rows: list) -> str:
     hdr = (f"{'case':>5} {'kind':8} {'rate':6} {'loss':>9} {'steps':>6} "
-           f"{'avg_step_ms':>12} {'tok/s':>10} {'comm_GB':>9} "
+           f"{'avg_step_ms':>12} {'e2e_s':>9} {'tok/s':>10} {'comm_GB':>9} "
            f"{'overlap':>8} {'rt_overlap':>10}")
     lines = [hdr, "-" * len(hdr)]
     for r in rows:
@@ -309,6 +322,7 @@ def _summary_table(rows: list) -> str:
             f"{r['case']:>5} {str(r['kind']):8} {str(r['rate']):6} "
             f"{_fmt(r['final_loss'], 4):>9} {str(r['num_steps'] or '-'):>6} "
             f"{_fmt((r['avg_step_s'] or 0) * 1000, 1):>12} "
+            f"{_fmt(r['elapsed_s'], 0):>9} "
             f"{_fmt(r['throughput_tok_s'], 1):>10} "
             f"{_fmt_gb(r['comm_gb']):>9} "
             f"{_fmt_pct(r['offline_overlap']):>8} "
@@ -337,13 +351,26 @@ def _pair_compare(rows: list) -> str:
         saved_gb = None
         if b.get("comm_gb") is not None and p.get("comm_gb") is not None:
             saved_gb = b["comm_gb"] - p["comm_gb"]
+        # 端到端时间优先用 case.json 的墙钟（含启动/建库/编译），拿不到退回归到
+        # step_csv 的训练循环耗时（total_step_s），两者口径不同，标签里区分开。
+        e2e_b, e2e_p = b.get("elapsed_s"), p.get("elapsed_s")
+        e2e_label = "端到端耗时"
+        if not e2e_b or not e2e_p:
+            e2e_b, e2e_p = b.get("total_step_s"), p.get("total_step_s")
+            e2e_label = "循环耗时"
+        speedup = (e2e_b / e2e_p) if (e2e_b and e2e_p) else None
         out.append(
             f"[{rate}] "
             f"通信量 baseline={_fmt_gb(b.get('comm_gb'))}GB "
             f"polar={_fmt_gb(p.get('comm_gb'))}GB "
             f"降低={_fmt_gb(saved_gb)}GB ({_fmt(comm_ratio)}x) | "
+            f"{e2e_label} baseline={_fmt(e2e_b, 0)}s "
+            f"polar={_fmt(e2e_p, 0)}s "
+            f"polar 快 {_fmt(speedup)}x | "
             f"重叠率 baseline={_fmt_pct(b.get('offline_overlap'))} "
-            f"polar={_fmt_pct(p.get('offline_overlap'))} | "
+            f"polar={_fmt_pct(p.get('offline_overlap'))} "
+            f"(实时 {_fmt_pct(b.get('rt_overlap_mean'))} / "
+            f"{_fmt_pct(p.get('rt_overlap_mean'))}) | "
             f"吞吐 polar/baseline={_fmt(tp_ratio)}x"
         )
     return "\n".join(out)
