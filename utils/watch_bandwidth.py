@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""实时监测 u62 / u210 两机之间的网络带宽。
+"""实时监测两台训练机（默认 node0=u13 / node1=u177）之间的网络带宽。
 
 读两个节点上 ens1f0 的 rx/tx 字节计数器，按间隔取差值算速率。只读，不干扰训练。
 
@@ -7,7 +7,7 @@
     python watch_bandwidth.py                 # 每秒刷一行
     python watch_bandwidth.py -i 5            # 5 秒一个采样
     python watch_bandwidth.py --once          # 只出一行（方便塞进别的脚本）
-    python watch_bandwidth.py --iface ens1f0
+    python watch_bandwidth.py --iface ens1f0    # 默认取 UDTCA_NIC_IFACE
 
 注意：读的是网卡总流量，不只是训练那部分（比如构建数据集时下 HF 也算进去）。
 
@@ -21,10 +21,14 @@ import sys
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
-LOCAL_HOST = "u62"
-REMOTE_HOST = "u210"          # ~/.ssh/config 里的别名
-DEFAULT_IFACE = "ens1f0"
+# 节点与网卡从 case_common 取，和训练编排用的是同一份配置（可用 UDTCA_NODE*
+# / UDTCA_NIC_IFACE 环境变量覆盖），避免两边对不上。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
+from case_common import LOCAL_HOST, NIC_IFACE, REMOTE_HOST   # noqa: E402
+
+DEFAULT_IFACE = NIC_IFACE
 # 交换机侧给每台机器的理论带宽
 THEORETICAL_GBPS = 12.5
 
@@ -129,7 +133,7 @@ def current_rate_limit(iface: str) -> str:
         remote = "?"
     if local == remote:
         return local
-    return f"u62={local} u210={remote}"
+    return f"{LOCAL_HOST}={local} {REMOTE_HOST}={remote}"
 
 
 def parse_args():
@@ -178,7 +182,7 @@ def main() -> None:
         print(f"监测 {LOCAL_HOST}(本机) <-> {REMOTE_HOST} 的 {iface}，"
               f"每 {args.interval:g} 秒一次，Ctrl-C 退出")
         print(f"交换机侧理论带宽 {THEORETICAL_GBPS} Gb/s，当前限速 {limit}")
-        print(f"{'时间':>8}  {'u62 收/发':>26}   {'u210 收/发':>26}   {'':>13}   ")
+        print(f"{'时间':>8}  {LOCAL_HOST + ' 收/发':>26}   {REMOTE_HOST + ' 收/发':>26}   {'':>13}   ")
         print("-" * 108)
 
     prevs = {LOCAL_HOST: read_counters_local(iface), REMOTE_HOST: remote.latest}

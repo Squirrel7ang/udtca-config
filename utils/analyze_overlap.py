@@ -62,11 +62,13 @@ def rank0_trace_path(case_dir: Path):
     trace_dir = case_dir / "tb_trace"
     if not trace_dir.is_dir():
         return None
+    # trace 文件名是 "<hostname>_<pid>.<ts>.json"，hostname 会随机器变（以前写死了
+    # u62_，换到 u13 上就找不到），所以只按 pid 匹配，不认主机名前缀。
     if pid is not None:
-        matches = sorted(trace_dir.glob(f"u62_{pid}.*.json"))
+        matches = sorted(trace_dir.glob(f"*_{pid}.*.json")) or sorted(trace_dir.glob(f"*_{pid}.json"))
         if matches:
             return matches[0]
-    matches = sorted(trace_dir.glob("u62_*.json"))
+    matches = sorted(trace_dir.glob("*.json"))
     return matches[0] if matches else None
 
 

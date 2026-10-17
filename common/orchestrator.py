@@ -23,6 +23,9 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from case_common import (
     ExperimentSpec,
+    LOCAL_HOST,
+    LOCAL_IP,
+    NIC_IFACE,
     REMOTE_BASE_DIR,
     REMOTE_HOST,
     SETUP_CMDS,
@@ -83,7 +86,7 @@ def cleanup_and_exit(signum, frame, spec: ExperimentSpec = None):
             except Exception as e:
                 print(f"Failed to kill local process: {e}")
 
-    # 中断时 ssh 链路断了，但 u210 上的 torchrun 不会跟着死，会一直占着卡；
+    # 中断时 ssh 链路断了，但 node 1 上的 torchrun 不会跟着死，会一直占着卡；
     # 限速规则也会留在两台机器上。这里一并收拾干净。
     tc_script = CURRENT_EXP_INFO[4] if CURRENT_EXP_INFO is not None else None
     print("\nCleaning up remote processes and traffic control...")
@@ -209,15 +212,15 @@ CASE_DIR="{case_dir}"
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Node {node_rank} of 2. MASTER_ADDR 必须指向跑 node_rank=0 的那台机器（本机 u62）。
+# Node {node_rank} of 2. MASTER_ADDR 必须指向跑 node_rank=0 的那台机器（本机 {LOCAL_HOST}）。
 SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 REPO_ROOT="$(cd "${{SCRIPT_DIR}}/../.." && pwd)"
 {case_block}
-MASTER_ADDR="${{MASTER_ADDR:-10.31.10.62}}"
+MASTER_ADDR="${{MASTER_ADDR:-{LOCAL_IP}}}"
 MASTER_PORT="${{MASTER_PORT:-{master_port}}}"
 NNODES="${{NNODES:-2}}"
 NPROC_PER_NODE="${{NPROC_PER_NODE:-16}}"
-NCCL_SOCKET_IFNAME="${{NCCL_SOCKET_IFNAME:-ens1f0}}"
+NCCL_SOCKET_IFNAME="${{NCCL_SOCKET_IFNAME:-{NIC_IFACE}}}"
 NCCL_IB_DISABLE="${{NCCL_IB_DISABLE:-1}}"
 
 export NCCL_ASYNC_ERROR_HANDLING="${{NCCL_ASYNC_ERROR_HANDLING:-1}}"
@@ -389,7 +392,7 @@ def run_polar_case(
             record, cases, case_dir, remote_case_dir,
             # node0 的脚本和限速脚本都是 runner 自己生成的，归集后原地不留
             local_scripts=[(script_0_path, True), (tc_script_path, True)],
-            # node1 实际跑的是 u210 上那份，必须从远程拉；拉完清掉远程的临时副本，
+            # node1 实际跑的是 node 1 上那份，必须从远程拉；拉完清掉远程的临时副本，
             # 本地那份是 runner 生成后 scp 过去的重复副本，也一并删掉（内容已在 case 目录里）
             remote_scripts=[(script_1_path.name,
                              f"{spec.remote_experiment_dir}/{script_1_path.name}", True,
@@ -397,7 +400,7 @@ def run_polar_case(
             exit_code=exit_code,
         )
         # node0 脚本和限速脚本当初也 scp 了一份到 u210，node1 那份 finish_case 已删；
-        # 这两份在 u210 上没人用，内容又都已归集到 case 目录，一并清掉
+        # 这两份在 node 1 上没人用，内容又都已归集到 case 目录，一并清掉
         print("   Cleaning up generated scripts on remote...")
         remote_rm(f"{spec.remote_experiment_dir}/{script_0_path.name}")
         remote_rm(f"{spec.remote_experiment_dir}/{tc_script_path.name}")
@@ -465,7 +468,7 @@ def run_baseline_case(
                         tc_script_path, spec.remote_experiment_dir, REMOTE_BASE_DIR)
 
     if runtime_log_enabled():
-        # node0 跑的是本地这份；node1 跑的是 u210 上那份，必须从远程读，
+        # node0 跑的是本地这份；node1 跑的是 node 1 上那份，必须从远程读，
         # 本地那份可能是改过的旧版（这两份本地确实不一致）
         record = {
             "case": case,
@@ -577,7 +580,7 @@ def run_baseline_case(
             # 仓库里已有的 baseline 脚本是受版本管理的，必须原地保留，只能拷不能移；
             # 限速脚本是 runner 自己生成的，归集后原地不留
             local_scripts=[(script_path_0, False), (tc_script_path, True)],
-            # node1 跑的是 u210 上那份，和本地同名文件内容可能不同，必须从远程拉；
+            # node1 跑的是 node 1 上那份，和本地同名文件内容可能不同，必须从远程拉；
             # 它同样是仓库文件，远程那份也保留。本地那份也是受版本管理的仓库文件，
             # 不是 runner 生成的副本，不能删，所以没有本地副本可清（第 4 项传 None）
             remote_scripts=[(script_name_1,

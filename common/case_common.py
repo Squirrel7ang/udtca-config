@@ -31,13 +31,28 @@ CONFIG_ROOT = COMMON_DIR.parent
 REPO_ROOT = CONFIG_ROOT.parent
 UTILS_DIR = CONFIG_ROOT / "utils"
 
-# 本机是 u62 (10.31.10.62)，节点 0 在本地跑；节点 1 通过 ssh 别名 u210 在远程跑。
-LOCAL_HOST = "62"
-LOCAL_IP = "10.31.10.62"
-REMOTE_HOST = "u210"  # ~/.ssh/config 里的别名，等价于 root@10.31.10.210
-REMOTE_IP = "10.31.10.210"
-REMOTE_BASE_DIR = "/data1/tangruijing/udtca"
-CONDA_ENV = "trj-test"
+def _env(name: str, default: str) -> str:
+    """读环境变量，空串按未设置处理（换机器时用环境变量覆盖，不用改代码）。"""
+    value = os.environ.get(name, "").strip()
+    return value or default
+
+
+# 默认按当前这两台机器配置：本机 u13 (10.31.10.13) 跑 node 0，u177 (10.31.10.177)
+# 跑 node 1。整套编排只在 node 0 上执行，它通过 ssh/scp 操控 node 1，所以只要这两台
+# 能免密互连、路径一致就行。
+#
+# 换机器不用改代码，导出下面这几个变量即可（也可以用 ~/.ssh/config 里的别名）：
+#   UDTCA_NODE0_HOST / UDTCA_NODE0_IP   node 0（= 本机，MASTER_ADDR 指向它）
+#   UDTCA_NODE1_HOST / UDTCA_NODE1_IP   node 1（ssh 目标，可以是 IP，也可以是别名）
+#   UDTCA_CONDA_ENV                    两侧同名的 conda 环境
+#   UDTCA_NIC_IFACE                    两机互联的网卡（tc 限速 / 字节计数用）
+LOCAL_HOST = _env("UDTCA_NODE0_HOST", "13")
+LOCAL_IP = _env("UDTCA_NODE0_IP", "10.31.10.13")
+REMOTE_HOST = _env("UDTCA_NODE1_HOST", "10.31.10.177")
+REMOTE_IP = _env("UDTCA_NODE1_IP", "10.31.10.177")
+REMOTE_BASE_DIR = _env("UDTCA_REMOTE_BASE_DIR", "/data1/tangruijing/udtca")
+CONDA_ENV = _env("UDTCA_CONDA_ENV", "udtca")
+NIC_IFACE = _env("UDTCA_NIC_IFACE", "ens1f0")
 HF_ENDPOINT = "https://hf-mirror.com"
 
 
@@ -53,7 +68,7 @@ class ExperimentSpec:
     experiment_dir: Path         # <repo>/experiments/<name>
     entry_script: str            # 训练入口文件名
     config_dir: Path             # <repo>/udtca-config/<name>
-    remote_experiment_dir: str   # u210 上的对应目录
+    remote_experiment_dir: str   # node 1 上的对应目录
     master_port: str = "29500"   # 生成的启动脚本里 MASTER_PORT 的默认值
 
     @property
@@ -105,9 +120,9 @@ def use_experiment(spec: ExperimentSpec) -> ExperimentSpec:
 # 继承环境的，两边会不一致。注意 ~/.bashrc 开头通常有 `[ -z "$PS1" ] && return` 这种
 # 非交互保护，直接 source 是空操作，所以先塞一个 PS1 再 source。
 #
-# 第 2 步的原因：两台的 ~/.bashrc 内容并不一样——u62 设了 COREX_PATH / CPATH /
+# 第 2 步的原因：两台的 ~/.bashrc 内容并不一样——node 0 设了 COREX_PATH / CPATH /
 # LIBRARY_PATH / TRITON_CUDA_SYSROOT / CUDA_DEVICE_MAX_CONNECTIONS=1，
-# 而 u210 没有。这些会影响编译和 CUDA/NCCL 行为，必须显式补齐，不能指望 .bashrc。
+# 而 node 1 没有。这些会影响编译和 CUDA/NCCL 行为，必须显式补齐，不能指望 .bashrc。
 # 用 ${VAR:-} 是因为这段也会被写进 launch.sh，那里开着 set -u。
 SETUP_CMDS = " && ".join(
     [
@@ -146,8 +161,8 @@ SETUP_CMDS = " && ".join(
         # 4) rendezvous 地址
         #    node_rank=0 的 torchrun 要**绑定** MASTER_ADDR:MASTER_PORT 当 rendezvous
         #    服务端，node_rank=1 是客户端去连它。所以 MASTER_ADDR 必须是跑
-        #    node_rank=0 的那台机器的地址——node_rank=0 在本机 u62 上跑，
-        #    写成 u210 的地址 u62 绑不上（EADDRNOTAVAIL），两边会一直干等。
+        #    node_rank=0 的那台机器的地址——node_rank=0 在本机（node 0）上跑，
+        #    写成 node 1 的地址本机绑不上（EADDRNOTAVAIL），两边会一直干等。
         #    训练脚本里都是 ${MASTER_ADDR:-...} 的可覆盖写法，export 出去就能生效，
         #    不用去改 experiments/qwen14b 下那些脚本。
         f"export MASTER_ADDR={LOCAL_IP}",
@@ -168,14 +183,14 @@ TORCHRUN_ONLY_KEYS = {"nproc_per_node", "nnodes", "node_rank", "master_addr", "m
 
 # 训练入口与并行拓扑（两个节点一致，只有 node_rank 不同）
 ENTRYPOINT = QWEN_DIR / "run_qwen14b_polar_dp_pp_tp.py"
-MASTER_ADDR = LOCAL_IP  # 必须指向跑 node_rank=0 的机器（本机 u62）
+MASTER_ADDR = LOCAL_IP  # 必须指向跑 node_rank=0 的机器（本机 node 0）
 MASTER_PORT = "29500"
 NNODES = 2
 NPROC_PER_NODE = 16
 
 # 机器之间的互联情况，用于交数据时交代环境。
 NETWORK = {
-    "interface": "ens1f0",
+    "interface": NIC_IFACE,
     "switch": "8 口 100Gb 交换机",
     "theoretical_bandwidth": "12.5 Gb/s",
     "note": "两个节点都通过 ens1f0 接到 8 口 100Gb 交换机，理论带宽 12.5 Gb/s；"
@@ -448,7 +463,7 @@ def remote_rm(remote_path: str) -> None:
 # ---------------------------------------------------------------- 通信量（网卡字节数）
 
 # 两机之间的互联网卡，和 NCCL_SOCKET_IFNAME / tc 脚本用的是同一个
-NIC_IFACE = "ens1f0"
+# （NIC_IFACE 在上面的节点配置里定义，可用 UDTCA_NIC_IFACE 覆盖）
 
 
 def read_nic_bytes_local(iface: str = NIC_IFACE):
@@ -465,7 +480,7 @@ def read_nic_bytes_local(iface: str = NIC_IFACE):
 
 
 def read_nic_bytes_remote(iface: str = NIC_IFACE):
-    """u210 上网卡的累计 (rx_bytes, tx_bytes)；读不到返回 None。"""
+    """node 1 上网卡的累计 (rx_bytes, tx_bytes)；读不到返回 None。"""
     cmd = (
         f"ssh {REMOTE_HOST} 'cat /sys/class/net/{iface}/statistics/rx_bytes; "
         f"cat /sys/class/net/{iface}/statistics/tx_bytes'"
@@ -578,7 +593,7 @@ def remove_peer_counters() -> None:
 def fetch_remote_text(remote_path: str) -> str:
     """读远程节点上的文件内容（只读，失败返回空串）。
 
-    node1 实际跑的是 u210 上那份脚本，本地那份可能被改过，所以 node1 的参数
+    node1 实际跑的是 node 1 上那份脚本，本地那份可能被改过，所以 node1 的参数
     必须从远程读，不能拿本地文件凑数。
     """
     try:
@@ -654,7 +669,7 @@ def ssh_execute(
     script = f"cd {base_dir} && {setup_cmds} && {cmd}"
     if log_path:
         # 远程只写自己的文件、不 tee 回终端：两个节点的 torchrun 输出交织在一起太乱，
-        # 终端只看 u62 的（PP 最后一级在 u62 上有 rank 14/15，loss 照样看得到）。
+        # 终端只看 node 0 的（PP 最后一级在 node 0 上有 rank 14/15，loss 照样看得到）。
         # 跑完 rsync 会把远程 case 目录整个拉回本地，日志不会丢。
         script = f"mkdir -p $(dirname {log_path}) && ({script}) >> {log_path} 2>&1"
         print(f"[REMOTE {host}] 输出写入远程文件（不回显）: {log_path}")
@@ -751,19 +766,19 @@ esac
 # ---------------------------------------------------------------- 中断清理
 
 
-# 只匹配本项目自己的训练进程：解释器必须是 trj-test 的 python3.10，
+# 只匹配本项目自己的训练进程：解释器必须来自本项目的 conda 环境（CONDA_ENV），
 # 且命令行里带训练入口脚本或 torchrun。
 # 绝不能按进程名模糊匹配（pkill -f torchrun）——这是共享机器，会误杀别人的任务。
-_TRAIN_KILL_SNIPPET = r'''
+_TRAIN_KILL_SNIPPET_TEMPLATE = r'''
 killed=0
 for pid in $(ls /proc 2>/dev/null); do
   case "$pid" in ''|*[!0-9]*) continue;; esac
   [ "$pid" = "$$" ] && continue
   cmd=$(tr '\0' ' ' < /proc/"$pid"/cmdline 2>/dev/null) || continue
   case "$cmd" in
-    /root/miniconda3/envs/trj-test/bin/python3.10*)
+    /root/miniconda3/envs/{conda_env}/bin/python3.10*)
       case "$cmd" in
-        *run_qwen14b_polar_dp_pp_tp.py*|*/bin/torchrun*)
+        *run_qwen14*_polar_dp_pp*tp.py*|*run_qwenvl*_polar_dp_pp*.py*|*/bin/torchrun*)
           kill "$pid" 2>/dev/null && killed=$((killed + 1));;
       esac;;
   esac
@@ -772,10 +787,16 @@ echo "$killed"
 '''
 
 
+def _train_kill_snippet() -> str:
+    """按当前 CONDA_ENV 渲染中断清理脚本（换环境名不用改代码）。"""
+    return _TRAIN_KILL_SNIPPET_TEMPLATE.replace("{conda_env}", CONDA_ENV)
+
+
+
 def kill_local_training(timeout: int = 60) -> None:
     """杀掉本机残留的训练进程（本地 torchrun 的 child 不一定随 SIGTERM 一起退）。"""
     try:
-        proc = subprocess.run(f"/bin/bash -c {_shq(_TRAIN_KILL_SNIPPET)}",
+        proc = subprocess.run(f"/bin/bash -c {_shq(_train_kill_snippet())}",
                               shell=True, capture_output=True, text=True, timeout=timeout)
         print(f"  [LOCAL] 清理训练进程: {proc.stdout.strip()} 个")
     except Exception as e:
@@ -785,10 +806,10 @@ def kill_local_training(timeout: int = 60) -> None:
 def kill_remote_training(timeout: int = 60) -> None:
     """杀掉远程节点上的训练进程。
 
-    中断 runner 时 ssh 链路断了，但 u210 上的 torchrun 不会跟着死，会一直占着卡。
+    中断 runner 时 ssh 链路断了，但 node 1 上的 torchrun 不会跟着死，会一直占着卡。
     这里 ssh 过去按「解释器路径 + 脚本名」精确匹配后 kill。
     """
-    payload = base64.b64encode(_TRAIN_KILL_SNIPPET.encode()).decode()
+    payload = base64.b64encode(_train_kill_snippet().encode()).decode()
     cmd = f"ssh {REMOTE_HOST} 'echo {payload} | base64 -d | bash'"
     try:
         proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
@@ -879,8 +900,8 @@ def write_launch_script(case_dir: Path, case: str, kind: str, params_by_node: Di
 # 这是一份完整、自包含的启动脚本，用于独立复现本次实验，不依赖 udtca-config。
 #
 # 用法:
-#   node 0 (u62, 10.31.10.62) : bash launch.sh 0
-#   node 1 (u210, 10.31.10.210): bash launch.sh 1
+#   node 0 ({LOCAL_HOST}, {LOCAL_IP}) : bash launch.sh 0
+#   node 1 ({REMOTE_HOST}, {REMOTE_IP}): bash launch.sh 1
 #
 # 网络限速（可选，需要 root，两个节点都要执行）:
 #   sudo bash {tc_script_name} start     # RATE="{rate}"
@@ -891,7 +912,7 @@ def write_launch_script(case_dir: Path, case: str, kind: str, params_by_node: Di
 # =============================================================================
 set -euo pipefail
 
-NODE_RANK="${{1:?用法: bash launch.sh <node_rank>  (0 在 u62, 1 在 u210)}}"
+NODE_RANK="${{1:?用法: bash launch.sh <node_rank>  (0 在 {LOCAL_HOST}, 1 在 {REMOTE_HOST})}}"
 CASE_DIR="{case_dir}"
 ENTRYPOINT="{ENTRYPOINT}"
 
@@ -925,8 +946,9 @@ def write_environment_info() -> Path:
     info = {
         "generated_at": datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
         "nodes": {
-            "node0": {"hostname": "u62", "ip": "10.31.10.62", "role": "本地节点，node_rank=0"},
-            "node1": {"hostname": "u210", "ip": "10.31.10.210",
+            "node0": {"hostname": LOCAL_HOST, "ip": LOCAL_IP,
+                      "role": "本地节点，node_rank=0"},
+            "node1": {"hostname": REMOTE_HOST, "ip": REMOTE_IP,
                       "role": "远程节点，node_rank=1", "ssh": REMOTE_HOST},
         },
         "repo_path": str(REPO_ROOT),          # 两个节点上的路径相同
@@ -964,7 +986,7 @@ def finish_case(record: Dict[str, Any], cases: list, case_dir: Path,
     move=False 用于仓库里已有的受版本管理的脚本（必须原地保留，移动会让下次跑不了）。
     script_log 不再留任何东西，脚本只存在于 case 目录里。
 
-    node1 的脚本必须从远程拉：node1 跑的是 u210 上那份，本地同名文件可能是改过的旧版
+    node1 的脚本必须从远程拉：node1 跑的是 node 1 上那份，本地同名文件可能是改过的旧版
     （baseline 那两份本地/远程内容确实不一样）。
 
     remote_scripts 的第 4 项「本地副本」：POLAR 路径下 node1 脚本是 runner 本地生成、
