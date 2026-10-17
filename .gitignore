@@ -9,3 +9,6 @@ script_log/
 runtime_log/
 debug_logs/
 *.log
+
+# 实时指标 API 的本地依赖（--install-deps 装到这里，不进版本库）
+qwen14b/.api_deps/
