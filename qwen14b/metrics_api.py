@@ -113,6 +113,13 @@ for _p in (CONFIG_ROOT / "common", CONFIG_ROOT / "utils", CONFIG_DIR):
 # 复用 run.py 的解析与汇总口径，保证 API 和命令行汇总看到的是同一套数
 import run as qrun  # noqa: E402
 
+# start_metrics_api.py --install-deps 会把依赖装到这里。直接把本文件当脚本跑时
+# 也认这个目录，否则同一个环境里 start_metrics_api.py 能起、metrics_api.py 报缺依赖，
+# 很容易踩。放在 fastapi 的 import 之前生效。
+_API_DEPS_DIR = CONFIG_DIR / ".api_deps"
+if _API_DEPS_DIR.is_dir() and str(_API_DEPS_DIR) not in sys.path:
+    sys.path.insert(0, str(_API_DEPS_DIR))
+
 # fastapi 只在真正起服务时（create_app / main）才 import：
 # 这样解析与采集这一层不依赖任何三方库，可以直接 import 出来对着真实日志做单测。
 _FASTAPI_HINT = (

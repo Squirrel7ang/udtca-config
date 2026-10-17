@@ -397,7 +397,9 @@ def main():
     args = make_arg_parser().parse_args()
 
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = Path(args.run_log_root) / f"run_{ts}"
+    # 必须是绝对路径：case 目录会作为训练进程的 cwd，日志/step_csv 都用它拼路径，
+    # 传相对路径时 tee 的目标在 cwd 里找不到同名目录（日志直接丢）。
+    run_dir = Path(args.run_log_root).expanduser().resolve() / f"run_{ts}"
     _bind_run_dir(run_dir)
 
     cc.set_runtime_log_enabled(args.runtime_log == "on")
