@@ -55,6 +55,7 @@ udtca-config/
 
 实时指标 API（给第三方测试平台）：`qwen14b/start_metrics_api.py`，跑在 node 0 上，
 提供 `/api/v1/metrics/latest`、`/stream`（SSE）、`/overview` 等接口。
+启动方式、接口字段、前端调用示例见 [`qwen14b/API_USAGE.md`](qwen14b/API_USAGE.md)。
 
 ```bash
 ssh 10.31.10.177 hostname                    # 免密 ssh 通
