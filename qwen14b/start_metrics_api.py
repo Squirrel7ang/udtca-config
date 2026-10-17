@@ -46,8 +46,12 @@ RUN_PY = CONFIG_DIR / "run.py"
 
 
 def _ensure_deps(install: bool) -> None:
-    """确认 fastapi/uvicorn 可用；--install-deps 时装到项目内的 .api_deps。"""
-    if install and DEPS_DIR.is_dir():
+    """确认 fastapi/uvicorn 可用；--install-deps 时装到项目内的 .api_deps。
+
+    .api_deps 已经装过就直接用，不必再带 --install-deps（训练环境里默认没有
+    fastapi，装过一次之后每次启动都还要求 flag 很容易踩）。
+    """
+    if DEPS_DIR.is_dir() and str(DEPS_DIR) not in sys.path:
         sys.path.insert(0, str(DEPS_DIR))
     missing: List[str] = []
     for mod in ("fastapi", "uvicorn"):
