@@ -1,9 +1,9 @@
 # udtca-config
 
 两节点分布式训练实验的**编排器**（不是训练代码）。按实验矩阵生成启动脚本 → 下发到
-u62/u210 → `tc` 限速 → 起训 → 回收日志到 `<仓库根>/runtime_log/<case>/`。
+u13/u177 → `tc` 限速 → 起训 → 回收日志到 `<仓库根>/runtime_log/<case>/`。
 
-只需在 **u62** 上跑一条命令，它会同时操控 u62（node 0）和 u210（node 1）。
+只需在 **u13** 上跑一条命令，它会同时操控 u13（node 0）和 u177（node 1）。
 
 ## 目录结构
 
@@ -38,14 +38,26 @@ udtca-config/
 | 项 | 值 |
 |---|---|
 | 仓库路径 | `/data1/tangruijing/udtca`（**两节点必须相同**） |
-| 调度节点 | u62 = `10.31.10.62`，**必须是 node 0**（torchrun 要 bind `MASTER_ADDR`） |
-| 训练节点 | u210 = `10.31.10.210`，通过 `ssh u210` 访问 |
-| conda 环境 | `trj-test`（两节点都要有，且 bitscom / polar-sgd 已 `pip install -e .`） |
+| 调度节点 | u13 = `10.31.10.13`，**必须是 node 0**（torchrun 要 bind `MASTER_ADDR`） |
+| 训练节点 | u177 = `10.31.10.177`，通过 `ssh 10.31.10.177` 访问 |
+| conda 环境 | `udtca`（两节点都要有，且 bitscom / polar-sgd 已 `pip install -e .`） |
 | 互联 | `ens1f0`，理论带宽 12.5 Gb/s |
 | HF 下载 | 走 `HF_ENDPOINT=https://hf-mirror.com`，不需要代理 |
 
+上面这些都不是写死的，换机器时导出环境变量即可（代码里默认就是当前这两台）：
+
+| 环境变量 | 含义 | 默认 |
+|---|---|---|
+| `UDTCA_NODE0_HOST` / `UDTCA_NODE0_IP` | node 0（本机，MASTER_ADDR 指向它） | `13` / `10.31.10.13` |
+| `UDTCA_NODE1_HOST` / `UDTCA_NODE1_IP` | node 1（ssh 目标，IP 或 ssh 别名） | `10.31.10.177` |
+| `UDTCA_CONDA_ENV` | 两侧同名的 conda 环境 | `udtca` |
+| `UDTCA_NIC_IFACE` | 两机互联网卡 | `ens1f0` |
+
+实时指标 API（给第三方测试平台）：`qwen14b/start_metrics_api.py`，跑在 node 0 上，
+提供 `/api/v1/metrics/latest`、`/stream`（SSE）、`/overview` 等接口。
+
 ```bash
-ssh u210 hostname                    # 免密 ssh 通
+ssh 10.31.10.177 hostname                    # 免密 ssh 通
 ixsmi | grep MiB                     # 两节点的卡都空闲（runner 自己也会查，占用直接退出）
 ```
 
@@ -115,8 +127,8 @@ runtime_log/
 ├── environment.json     机器与网络环境说明（交数据时用）
 └── 0021/                一个 case 一个目录，编号按实际运行顺序递增
     ├── launch.sh                       自包含的复现脚本（不依赖 runner）
-    ├── 0_train_<exp>_exp1.sh           node0(u62) 实际跑的
-    ├── 1_train_<exp>_exp1.sh           node1(u210) 实际跑的（跑完从远程拉回）
+    ├── 0_train_<exp>_exp1.sh           node0(u13) 实际跑的
+    ├── 1_train_<exp>_exp1.sh           node1(u177) 实际跑的（跑完从远程拉回）
     ├── traffic_control_exp1.sh         限速脚本（start / stop）
     ├── train_node0.log                 node0 的完整输出
     ├── train_node1.log                 node1 的完整输出
@@ -133,8 +145,8 @@ runtime_log/
 | `case.json` | 每个 case 一条：编号、`test_index`、`kind`（polar / baseline）、限速、实际下发的启动参数、`exit_code`、以及**训练窗口内两机之间的通信量** `comm_bytes` / `comm_gb`（1GB=1e9B）。 |
 | case 编号 | 按**实际运行顺序**递增，不是 `test.json` 的 index；同一个 index 重跑会拿到新编号。 |
 | `launch.sh` | 把该 case 的下发、限速、起训打包好，两个终端各跑 `bash launch.sh 0` / `bash launch.sh 1` 就能复现，不依赖 runner。 |
-| `*_train_<exp>_exp1.sh` | 实际下发的训练脚本；`0_` 是 u62 的，`1_` 是 u210 的。 |
-| `train_node*.log` | u210 的输出只写 `train_node1.log`、不回显终端（两节点输出交织太乱）；PP 最后一级在 u62 上有副本，loss 在终端照样看得到。 |
+| `*_train_<exp>_exp1.sh` | 实际下发的训练脚本；`0_` 是 u13 的，`1_` 是 u177 的。 |
+| `train_node*.log` | u177 的输出只写 `train_node1.log`、不回显终端（两节点输出交织太乱）；PP 最后一级在 u13 上有副本，loss 在终端照样看得到。 |
 | `nccl_*.log` | 训练时开 `NCCL_DEBUG` 落下来的集合通信日志，每个 rank 一个文件。通信量的另一套口径从这里读（`count × dtype`），对应 `utils/parse_nccl_bytes.py`。 |
 | `tb_trace/` | profiler trace，每个 rank 一份 json。重叠率就是从这里算：取 rank0 那份，对应 `utils/analyze_overlap.py`、`utils/overlap_interval.py`。 |
 
@@ -143,20 +155,20 @@ runtime_log/
 手动复现某个 case（两个终端各跑一条）：
 
 ```bash
-bash runtime_log/0001/launch.sh 0     # u62
-bash runtime_log/0001/launch.sh 1     # u210
+bash runtime_log/0001/launch.sh 0     # u13
+bash runtime_log/0001/launch.sh 1     # u177
 ```
 
 ## 注意事项
 
-- **u62 必须是 MASTER**。`node_rank=0` 的 torchrun 会 bind `MASTER_ADDR`，绑别人的地址
+- **u13 必须是 MASTER**。`node_rank=0` 的 torchrun 会 bind `MASTER_ADDR`，绑别人的地址
   会 `EADDRNOTAVAIL` 然后两边干等。`SETUP_CMDS` 和仓库里的启动脚本默认值都指向
-  `10.31.10.62`，双保险。
+  `10.31.10.13`，双保险。
 - **`tc` 只限出向**，两个节点都要执行，跑完必须撤（runner 会自动撤；Ctrl-C 中断时也会
   杀远程训练进程并撤限速）。留着的限速规则会影响这台共享机器上的其他人。
 - **日志目录叫 `runtime_log` 不叫 `log`**：仓库根下的 `log/` 是早期实验留下的几十 GB 旧结构。
 - **只 copy 不 move**：仓库里已有的 baseline 脚本受版本管理，原地保留；runner 生成的
   polar 脚本归集后会从原件移走，下次同 index 重新生成。
 - **GPU 占用检查**在入口最开头跑：`--query-compute-apps` 有进程，或显存 > 256 MiB
-  （空载基线 68 MiB）就判定被占用并退出。u210 的 `ixsmi` 不在 PATH 里，走绝对路径
+  （空载基线 68 MiB）就判定被占用并退出。u177 的 `ixsmi` 不在 PATH 里，走绝对路径
   `/usr/local/corex-4.4.0/bin/ixsmi`。
