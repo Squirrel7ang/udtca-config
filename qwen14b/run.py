@@ -390,6 +390,9 @@ def make_arg_parser() -> argparse.ArgumentParser:
                    help=f"运行结果根目录（默认 {DEFAULT_RUN_ROOT}）")
     p.add_argument("--runtime-log", choices=["on", "off"], default="on",
                    help="off 时只跑训练不归档（默认 on）")
+    p.add_argument("--no-tc", action="store_true",
+                   help="不下发 tc 限速（共享机器被抢、只想验证能否跑通时用；"
+                        "此时 2gbit/1gbit 两组结果不再有带宽差异）")
     return p
 
 
@@ -405,6 +408,7 @@ def main():
     cc.set_runtime_log_enabled(args.runtime_log == "on")
     orch.use_experiment(QWEN14B_SPEC)
     orch.install_signal_handlers(QWEN14B_SPEC)
+    orch.TC_ENABLED = not args.no_tc
 
     print(f"{'=' * 80}")
     print(f"Qwen14B 一键测试：run_dir = {run_dir}")

@@ -62,6 +62,33 @@ from case_common import HF_ENDPOINT
 LOCAL_PROCESS = None
 CURRENT_EXP_INFO = None  # (index, timestamp, script0, script1, tc_script, remote_dir, base_dir)
 
+# 是否真的下发 tc 限速。共享机器上卡容易被别人抢、限速还会把初始化拉长到
+# 6–10 分钟，冒烟时经常只想验证"能不能跑通"，这时关掉限速能快很多。
+# run.py 的 --no-tc 会把它置 False；generate_and_run.py 默认保持 True。
+TC_ENABLED = True
+
+
+def tc_start(tc_script_path: Path, remote_dir: str, local_cwd: Path) -> None:
+    """两节点下发限速；TC_ENABLED=False 时只打印一行，不做任何动作。"""
+    if not TC_ENABLED:
+        print("\n[tc] --no-tc：跳过限速（两端都不下发）")
+        return
+    print("\nStarting traffic control [LOCAL]...")
+    execute_command(f"bash {tc_script_path} start", cwd=local_cwd)
+    print("Starting traffic control [REMOTE]...")
+    ssh_execute(f"bash {remote_dir}/{tc_script_path.name} start")
+
+
+def tc_stop(tc_script_path: Path, remote_dir: str, local_cwd: Path) -> None:
+    """两节点撤销限速；TC_ENABLED=False 时同样跳过（本来就没下发）。"""
+    if not TC_ENABLED:
+        print("\n[tc] --no-tc：无需撤销（两端都没有下发限速）")
+        return
+    print("\nStopping traffic control [LOCAL]...")
+    execute_command(f"bash {tc_script_path} stop", cwd=local_cwd)
+    print("Stopping traffic control [REMOTE]...")
+    ssh_execute(f"bash {remote_dir}/{tc_script_path.name} stop")
+
 
 # ---------------------------------------------------------------- 中断清理
 
@@ -339,15 +366,18 @@ def run_polar_case(
         cwd=spec.experiment_dir,
     )
 
-    print("\n4. Stopping existing traffic control [LOCAL]...")
-    execute_command(f"{tc_script_path} stop", cwd=spec.experiment_dir)
-    print("\n4. Stopping existing traffic control [REMOTE]...")
-    ssh_execute(f"{spec.remote_experiment_dir}/{tc_script_path.name} stop")
+    if TC_ENABLED:
+        print("\n4. Stopping existing traffic control [LOCAL]...")
+        execute_command(f"{tc_script_path} stop", cwd=spec.experiment_dir)
+        print("\n4. Stopping existing traffic control [REMOTE]...")
+        ssh_execute(f"{spec.remote_experiment_dir}/{tc_script_path.name} stop")
 
-    print("\n5. Starting traffic control [LOCAL]...")
-    execute_command(f"{tc_script_path} start", cwd=spec.experiment_dir)
-    print("\n5. Starting traffic control [REMOTE]...")
-    ssh_execute(f"{spec.remote_experiment_dir}/{tc_script_path.name} start")
+        print("\n5. Starting traffic control [LOCAL]...")
+        execute_command(f"{tc_script_path} start", cwd=spec.experiment_dir)
+        print("\n5. Starting traffic control [REMOTE]...")
+        ssh_execute(f"{spec.remote_experiment_dir}/{tc_script_path.name} start")
+    else:
+        print("\n4-5. --no-tc：跳过限速下发（两端都不加 tc）")
 
     # 两边的 torchrun 输出各自落到 case 目录里，远程那份跑完由 rsync 拉回来
     node0_log = (case_dir / "train_node0.log") if case_dir else None
@@ -381,10 +411,7 @@ def run_polar_case(
     vol_bytes, vol_gb = _volume_between(vol_start, vol_end)
     _report_comm_volume(record, vol_bytes, vol_gb)
 
-    print("\n9. Stopping traffic control [LOCAL]...")
-    execute_command(f"{tc_script_path} stop")
-    print("\n9. Stopping traffic control [REMOTE]...")
-    ssh_execute(f"{spec.remote_experiment_dir}/{tc_script_path.name} stop")
+    tc_stop(tc_script_path, spec.remote_experiment_dir, spec.experiment_dir)
 
     if runtime_log_enabled():
         print("\n10. Archiving scripts...")
@@ -518,15 +545,18 @@ def run_baseline_case(
     execute_command(f"scp {tc_script_path} {REMOTE_HOST}:{spec.remote_experiment_dir}/",
                     cwd=spec.experiment_dir)
 
-    print("\n3. Stopping existing traffic control [LOCAL]...")
-    execute_command(f"bash {tc_script_path} stop", cwd=spec.experiment_dir)
-    print("\n3. Stopping existing traffic control [REMOTE]...")
-    ssh_execute(f"bash {spec.remote_experiment_dir}/{tc_script_path.name} stop")
+    if TC_ENABLED:
+        print("\n3. Stopping existing traffic control [LOCAL]...")
+        execute_command(f"bash {tc_script_path} stop", cwd=spec.experiment_dir)
+        print("\n3. Stopping existing traffic control [REMOTE]...")
+        ssh_execute(f"bash {spec.remote_experiment_dir}/{tc_script_path.name} stop")
 
-    print("\n4. Starting traffic control [LOCAL]...")
-    execute_command(f"bash {tc_script_path} start", cwd=spec.experiment_dir)
-    print("\n4. Starting traffic control [REMOTE]...")
-    ssh_execute(f"bash {spec.remote_experiment_dir}/{tc_script_path.name} start")
+        print("\n4. Starting traffic control [LOCAL]...")
+        execute_command(f"bash {tc_script_path} start", cwd=spec.experiment_dir)
+        print("\n4. Starting traffic control [REMOTE]...")
+        ssh_execute(f"bash {spec.remote_experiment_dir}/{tc_script_path.name} start")
+    else:
+        print("\n3-4. --no-tc：跳过限速下发（两端都不加 tc）")
 
     # 两边的 torchrun 输出各自落到 case 目录里，远程那份跑完由 rsync 拉回来
     node0_log = (case_dir / "train_node0.log") if case_dir else None
@@ -568,10 +598,7 @@ def run_baseline_case(
     vol_bytes, vol_gb = _volume_between(vol_start, vol_end)
     _report_comm_volume(record, vol_bytes, vol_gb)
 
-    print("\n8. Stopping traffic control [LOCAL]...")
-    execute_command(f"bash {tc_script_path} stop", cwd=spec.experiment_dir)
-    print("\n8. Stopping traffic control [REMOTE]...")
-    ssh_execute(f"bash {spec.remote_experiment_dir}/{tc_script_path.name} stop")
+    tc_stop(tc_script_path, spec.remote_experiment_dir, spec.experiment_dir)
 
     if runtime_log_enabled():
         print("\n9. Archiving scripts...")
