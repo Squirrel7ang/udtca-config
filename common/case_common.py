@@ -158,6 +158,9 @@ SETUP_CMDS = " && ".join(
         "unset __conda_setup",
         "(conda deactivate >/dev/null 2>&1 || true)",
         f"conda activate {CONDA_ENV}",
+        # 3.5) 训练输出没有 tty 时 Python 默认块缓冲，14B 模型初始化好几分钟里
+        #      一行都看不到，容易被误判成"压根没启动"。强制行缓冲，进度实时可见。
+        "export PYTHONUNBUFFERED=1",
         # 4) rendezvous 地址
         #    node_rank=0 的 torchrun 要**绑定** MASTER_ADDR:MASTER_PORT 当 rendezvous
         #    服务端，node_rank=1 是客户端去连它。所以 MASTER_ADDR 必须是跑
