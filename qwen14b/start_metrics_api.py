@@ -90,6 +90,8 @@ def _start_training(args: argparse.Namespace) -> Optional[subprocess.Popen]:
         cmd += ["--max-steps", str(args.max_steps)]
     if args.runtime_log:
         cmd += ["--runtime-log", args.runtime_log]
+    if getattr(args, "no_tc", False):
+        cmd += ["--no-tc"]
     log_dir = Path(args.training_log_dir) if args.training_log_dir else REPO_ROOT / "run_log"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"metrics_api_training_{time.strftime('%Y-%m-%d_%H-%M-%S')}.log"
@@ -133,6 +135,8 @@ def make_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--with-training", action="store_true",
                    help="同时把 run.py 的 4-case 测试拉起来（默认只起 API）")
     p.add_argument("--cases", default=None, help="传给 run.py 的 --cases")
+    p.add_argument("--no-tc", action="store_true",
+                   help="传给 run.py：不下发 tc 限速（只想验证能否跑通时用）")
     p.add_argument("--max-steps", type=int, default=None,
                    help="传给 run.py 的 --max-steps（冒烟用）")
     p.add_argument("--runtime-log", choices=["on", "off"], default=None,

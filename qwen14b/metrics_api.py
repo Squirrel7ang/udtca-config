@@ -428,6 +428,11 @@ class MetricStore:
                  log_file: Optional[Path] = None):
         self.run_log_root = Path(run_log_root)
         self.run_dir: Optional[Path] = Path(run_dir) if run_dir else None
+        # 没显式给 --run-dir 时是"自动跟最新 run"模式：必须每次重新解析，
+        # 否则 `--with-training` 里 run.py 还没建目录、先锁到上一次 run 后
+        # 就永远不切了（前端看到的一直是旧数据）。
+        self._auto_run_dir = run_dir is None
+        self._current_run_dir: Optional[Path] = None
         # 手工起训练（没有 runner 的 tee 包裹）时直接盯一个日志文件
         self.log_file: Optional[Path] = Path(log_file) if log_file else None
         self.window = max(1, int(window))
@@ -442,15 +447,21 @@ class MetricStore:
     # ---- 发现 run / case ----
 
     def resolve_run_dir(self) -> Optional[Path]:
-        if self.run_dir and (self.run_dir / DEFAULT_CASE_JSON).exists():
-            return self.run_dir
-        if self.run_dir and self.run_dir.is_dir() and any(self.run_dir.glob("*/")):
-            return self.run_dir
+        if not self._auto_run_dir:
+            # 显式 --run-dir：只认这一个
+            if self.run_dir and (self.run_dir / DEFAULT_CASE_JSON).exists():
+                return self.run_dir
+            if self.run_dir and self.run_dir.is_dir() and any(self.run_dir.glob("*/")):
+                return self.run_dir
         if not self.run_log_root.is_dir():
             return None
         runs = sorted((p for p in self.run_log_root.glob("run_*") if p.is_dir()),
                       key=lambda p: p.name)
-        return runs[-1] if runs else None
+        if not runs:
+            return None
+        # 刚创建的 run 目录可能还没有 case.json，优先取已有 case.json 的最新一个
+        with_meta = [p for p in runs if (p / DEFAULT_CASE_JSON).exists()]
+        return (with_meta or runs)[-1]
 
     def _case_meta(self) -> Dict[str, Dict[str, Any]]:
         run_dir = self.resolve_run_dir()
@@ -472,6 +483,11 @@ class MetricStore:
 
     def _discover_cases(self) -> None:
         run_dir = self.resolve_run_dir()
+        if run_dir != self._current_run_dir:
+            # 自动模式切到了新的 run：旧 case 的 state（tail 偏移、历史）必须丢掉，
+            # 否则新 run 的 0001 会接着旧 run 的偏移继续读。
+            self.cases.clear()
+            self._current_run_dir = run_dir
         self.run_dir = run_dir
         if run_dir is None:
             self._discover_adhoc()
@@ -687,6 +703,17 @@ class MetricStore:
 
 # ---------------------------------------------------------------- FastAPI
 
+# 离线重叠率要解析 rank0 的 profiler trace（单个文件 ~100 MB，一次 6 秒以上）。
+# trace 跑完就不再变，所以按 (路径, mtime, size) 缓存，避免每次 /overview 都重解析。
+_OFFLINE_OVERLAP_CACHE: Dict[Tuple[str, float, int], Optional[float]] = {}
+
+# run._collect_case 一次要 1–2 秒（解析 step_csv / rt-metric / trace），4 个 case
+# 就是 6 秒以上。按 case.json 的 mtime 缓存整批 row，前端轮询 /overview 时基本是瞬回；
+# case.json 在 case 开始/结束时会被重写，mtime 一变缓存自然失效。
+_OVERVIEW_ROWS_CACHE: Dict[Tuple[str, int], Tuple[float, List[Dict[str, Any]]]] = {}
+_OVERVIEW_ROWS_TTL_S = 10.0
+
+
 def overview_payload(store: MetricStore) -> Dict[str, Any]:
     """4 个 case 的性能比对 + 通信量端到端优化。
 
@@ -713,7 +740,19 @@ def overview_payload(store: MetricStore) -> Dict[str, Any]:
     except OSError:
         default_config = {}
 
-    rows = [qrun._collect_case(rec, default_config) for rec in records]
+    try:
+        rows_key = (str(case_json), case_json.stat().st_mtime_ns)
+    except OSError:
+        rows_key = (str(case_json), 0)
+    cached = _OVERVIEW_ROWS_CACHE.get(rows_key)
+    if cached is not None and time.time() - cached[0] <= _OVERVIEW_ROWS_TTL_S:
+        import copy
+        rows = copy.deepcopy(cached[1])
+    else:
+        import copy
+        rows = [qrun._collect_case(rec, default_config) for rec in records]
+        _OVERVIEW_ROWS_CACHE.clear()
+        _OVERVIEW_ROWS_CACHE[rows_key] = (time.time(), copy.deepcopy(rows))
 
     # run.py 只读字典序第一个 csv，这里用更全的 step_csv 口径把吞吐补准
     for row in rows:
@@ -747,12 +786,18 @@ def overview_payload(store: MetricStore) -> Dict[str, Any]:
         if not case_dir.is_dir():
             continue
         try:
-            import overlap_interval as oi
             trace = rank0_trace_path(case_dir)
             if trace is not None:
-                res = oi.analyze(trace, "last")
-                if res:
-                    row["offline_overlap"] = res["overlap"]
+                stat = trace.stat()
+                cache_key = (str(trace), stat.st_mtime, stat.st_size)
+                if cache_key not in _OFFLINE_OVERLAP_CACHE:
+                    import overlap_interval as oi
+                    res = oi.analyze(trace, "last")
+                    _OFFLINE_OVERLAP_CACHE[cache_key] = (
+                        res["overlap"] if res else None)
+                overlap = _OFFLINE_OVERLAP_CACHE[cache_key]
+                if overlap is not None:
+                    row["offline_overlap"] = overlap
         except Exception:                       # noqa: BLE001 - 展示用，不能因此 500
             pass
 
@@ -892,8 +937,9 @@ def create_app(store: MetricStore):
 
     @app.get("/api/v1/overview")
     async def overview() -> Dict[str, Any]:
-        store.refresh()
-        payload = overview_payload(store)
+        # 解析 trace / 读 step_csv 都是阻塞 I/O，丢到线程里跑，别卡住事件循环
+        # （否则解析期间 SSE 和其它请求全部停住）。store 由后台 poller 每秒刷新。
+        payload = await asyncio.to_thread(overview_payload, store)
         if not payload.get("available"):
             raise HTTPException(status_code=404, detail=payload.get("reason"))
         return payload

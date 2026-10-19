@@ -115,6 +115,38 @@ def _run_allocate_case() -> tuple:
     return case, case_dir, remote_case_dir, cases
 
 
+class _Tee:
+    """把输出同时写到终端和文件（run.log）。
+
+    只实现 print 用到的几个方法；isatty 返回 False，让上层当作非终端处理。
+    """
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for stream in self._streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self):
+        for stream in self._streams:
+            stream.flush()
+
+    def isatty(self):
+        return False
+
+
+def _tee_stdout(run_dir: Path) -> Path:
+    """把 stdout/stderr 同时落一份到 <run_dir>/run.log，返回日志路径。"""
+    log_path = run_dir / "run.log"
+    # 行缓冲：训练卡住时也能实时 tail 到最后的输出
+    fh = open(log_path, "a", encoding="utf-8", buffering=1)
+    sys.stdout = _Tee(sys.__stdout__, fh)
+    sys.stderr = _Tee(sys.__stderr__, fh)
+    return log_path
+
+
 def _bind_run_dir(run_dir: Path) -> None:
     global RUN_DIR, RUN_NAME
     RUN_DIR = run_dir
@@ -404,6 +436,7 @@ def main():
     # 传相对路径时 tee 的目标在 cwd 里找不到同名目录（日志直接丢）。
     run_dir = Path(args.run_log_root).expanduser().resolve() / f"run_{ts}"
     _bind_run_dir(run_dir)
+    run_log_path = _tee_stdout(run_dir)
 
     cc.set_runtime_log_enabled(args.runtime_log == "on")
     orch.use_experiment(QWEN14B_SPEC)
@@ -412,7 +445,14 @@ def main():
 
     print(f"{'=' * 80}")
     print(f"Qwen14B 一键测试：run_dir = {run_dir}")
+    print(f"标准输出实时写入: {run_log_path}")
     print(f"{'=' * 80}")
+
+    # kube-proxy 会 REJECT 一批临时端口，NCCL 的 bind(0) 一旦撞上就卡初始化。
+    # 每次跑之前检查一遍，并把冲突端口从内核的自动分配范围里排除掉。
+    if not cc.check_port_conflicts(fix=True):
+        print("\n临时端口仍与被 REJECT 的端口冲突，训练可能卡在初始化，本次退出。")
+        sys.exit(1)
 
     if args.runtime_log == "on":
         print(f"Environment info written to: {cc.write_environment_info()}")

@@ -25,9 +25,15 @@ cd /data1/tangruijing/udtca
 # 完整跑：每个 case 30 步（default.json / run_cases.json）
 python udtca-config/qwen14b/run.py
 
-# 冒烟：每个 case 3 步（约 10 分钟）
+# 冒烟：每个 case 3 步
 python udtca-config/qwen14b/run.py --max-steps 3
+
+# 冒烟且不限速（共享机器被抢、只想验证能否跑通时最快）
+python udtca-config/qwen14b/run.py --max-steps 3 --no-tc
 ```
+
+> `--no-tc` 会让不同 `rate` 的 case 不再有带宽差异，只能用来验证流程，不能用来做
+> 2gbit vs 1gbit 的对比。
 
 跑哪几个 case 由 `udtca-config/qwen14b/run_cases.json` 决定，默认 4 个：
 
@@ -47,6 +53,7 @@ python udtca-config/qwen14b/run.py --max-steps 3
 
 ```
 run_log/run_2026-10-17_03-14-12/
+├── run.log                 run.py 的完整标准输出/错误（含最后的 4-case 对比），跑的过程中实时写
 ├── case.json               case 索引（编号 / kind / rate / 日志目录 / 通信量）
 ├── environment.json        机器与网络环境
 ├── summary.json/.md        4-case 汇总（跑完才有）
@@ -105,6 +112,7 @@ python udtca-config/qwen14b/start_metrics_api.py --log-file /tmp/train_node0.log
 | `--window` | `20` | 滚动平均窗口步数 |
 | `--with-training` | 关 | 同时拉起 `run.py` 的 4-case 训练 |
 | `--max-steps` | 无 | 传给 `run.py`，冒烟用 |
+| `--no-tc` | 关 | 传给 `run.py`，不限速；只验证流程时用 |
 | `--install-deps` | 关 | 缺 fastapi/uvicorn 时装到项目内 `.api_deps/` |
 | `--demo` / `--demo-live` | 关 | 造一份假 run（`--demo-live` 每 2 秒追加一步），没卡也能给前端联调 |
 
@@ -115,6 +123,18 @@ python udtca-config/qwen14b/start_metrics_api.py --log-file /tmp/train_node0.log
 ```bash
 /root/miniconda3/envs/megatron/bin/python udtca-config/qwen14b/start_metrics_api.py
 ```
+
+> **用哪个 python**：本机 PATH 里的 `python3` 是系统自带的 3.8，fastapi 的新版
+> 依赖装不上也跑不起来。请显式用 conda 环境里的解释器：
+>
+> ```bash
+> /root/miniconda3/envs/udtca/bin/python3.10 \
+>     udtca-config/qwen14b/start_metrics_api.py --install-deps ...
+> ```
+>
+> `.api_deps/` 里的包和解释器版本是绑定的：如果之前用别的 python 装过又报
+> `module 'typing' has no attribute '_SpecialGenericAlias'` / `'type' object is
+> not subscriptable`，删掉 `udtca-config/qwen14b/.api_deps` 用正确的解释器重装一次。
 
 验证：
 
@@ -164,6 +184,10 @@ es.addEventListener("metrics", (e) => {
   但经 Nginx 之类的代理时记得关缓冲：响应头已带 `X-Accel-Buffering: no`）。
 - 断线重连由浏览器自动做；也可以用 `?case=0001` 只看某个 case。
 - 端到端延迟 ≈ `--poll-interval` + 一步训练时间，不是逐 token 级别。
+
+> **不带 `case` 时取的是"当前正在跑的那个 case"**。跑到 baseline case 时它没有
+> `[rt-metric]` 行，接口会返回 `available=false`；想看刚跑完的 polar case 就显式
+> 传 `?case=0001`、`?case=0003`。前端做 4-case 对比时建议一律带 `case`。
 
 ### 3.3 轮询（简单场景）
 
@@ -239,6 +263,11 @@ const { available, case: caseId, metrics, rolling } = await r.json();
 | `comparison` | 按带宽成对的文字对比（通信量、端到端耗时、重叠率） |
 | `summary_json` | 若 `summary.json` 已生成则原样带上 |
 
+`offline_overlap` 要解析 rank0 的 profiler trace（单个文件约 100 MB），第一次调用
+可能要十几秒；结果按 trace 的 `(路径, mtime, size)` 缓存，整批 case 汇总也按
+`case.json` 的 mtime 缓存 10 秒，所以除第一次外基本是毫秒级。解析在工作线程里做，
+不会卡住 SSE 或其它接口（第一次调用期间 `/health` 仍然是 3 ms 返回）。
+
 注意 baseline 的 case 没有 `[rt-metric]` 行，所以 `rt_overlap_mean` 为 `null`，
 这是预期的——baseline 不做 DP-PP 通信重叠统计。
 
@@ -248,7 +277,10 @@ const { available, case: caseId, metrics, rolling } = await r.json();
 
 | 现象 | 处理 |
 |---|---|
+| 训练日志里反复刷 `[c10d] ... client socket ... err=-3`、久不进训练循环、显存不涨 | rendezvous 阶段反向 DNS 超时，不是训练代码问题。在**两台机器** `/etc/hosts` 加 `10.31.10.13 u13` / `10.31.10.177 u177`，详见 `udtca-config/README.md` 的「排障」 |
+| 重新起跑报 `Address already in use` | 上次中断留下的 torchrun 还占着 29500/29501：`ss -ltnp \| grep -E '29500\|29501'` 找到 pid 后**精确** kill |
 | 启动报缺 `fastapi` / `uvicorn` | 加一次 `--install-deps`（装到 `.api_deps/`，不动训练环境），或改用 `megatron` 环境 |
+| 启动即报 `module 'typing' has no attribute '_SpecialGenericAlias'` / `'type' object is not subscriptable` | 用了系统 Python 3.8。改用 `/root/miniconda3/envs/udtca/bin/python3.10`，必要时删掉 `.api_deps` 重装 |
 | `run_dir` 指向了上一次的 run | 传 `--run-dir` 明确指定本次目录 |
 | `available=false`、`steps_seen=0` | 确认训练已进入第一个 step（模型初始化/编译要几分钟）；确认 `--run-dir` 正确 |
 | `overlap_available=false` | 训练侧没算出 CUDA event，看 `overlap_reason`；训练日志里应有 `[rt-metric]` 行 |

@@ -32,6 +32,7 @@ from case_common import (
     allocate_case,
     bytes_to_gb,
     check_gpus_free,
+    check_port_conflicts,
     execute_command,
     finalize_process_log,
     finish_case,
@@ -426,7 +427,7 @@ def run_polar_case(
                              script_1_path)],
             exit_code=exit_code,
         )
-        # node0 脚本和限速脚本当初也 scp 了一份到 u210，node1 那份 finish_case 已删；
+        # node0 脚本和限速脚本当初也 scp 了一份到 node 1，node1 那份 finish_case 已删；
         # 这两份在 node 1 上没人用，内容又都已归集到 case 目录，一并清掉
         print("   Cleaning up generated scripts on remote...")
         remote_rm(f"{spec.remote_experiment_dir}/{script_0_path.name}")
@@ -651,6 +652,11 @@ def make_arg_parser(description: str) -> argparse.ArgumentParser:
         help="临时覆盖 default.json/test.json 的 max-steps。做冒烟/短测时用，"
              "不传则用配置里的值。",
     )
+    parser.add_argument(
+        "--no-tc", action="store_true",
+        help="不下发 tc 限速（共享机器被抢、只想验证能否跑通时用；"
+             "此时不同 rate 的 case 不再有带宽差异）",
+    )
     return parser
 
 
@@ -669,6 +675,11 @@ def run_experiments(
     # 会指向错误的训练入口。
     use_experiment(spec)
 
+    global TC_ENABLED
+    if getattr(args, "no_tc", False):
+        TC_ENABLED = False
+        print("--no-tc：本次不下发 tc 限速")
+
     if args.runtime_log is not None:
         set_runtime_log_enabled(args.runtime_log == "on")
 
@@ -677,6 +688,11 @@ def run_experiments(
     # 跑之前确认两台机器的卡都没被占用；被占用就报错退出，不等
     if not check_gpus_free():
         print("\nGPU 被占用，本次退出。等卡空出来再重跑。")
+        sys.exit(1)
+
+    # kube-proxy 会 REJECT 一批临时端口，NCCL 的 bind(0) 撞上就卡初始化。
+    if not check_port_conflicts(fix=True):
+        print("\n临时端口仍与被 REJECT 的端口冲突，训练可能卡在初始化，本次退出。")
         sys.exit(1)
 
     if runtime_log_enabled():

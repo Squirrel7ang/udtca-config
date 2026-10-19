@@ -145,6 +145,13 @@ SETUP_CMDS = " && ".join(
         'export TRITON_CUDA_SYSROOT="$COREX_PATH"',
         'export BITSCOM_CUDA_COMPILER="$COREX_PATH/bin/clang++"',
         "export CUDA_DEVICE_MAX_CONNECTIONS=1",
+        # NCCL bootstrap 默认只重试 34 次 × 100ms（约 3 秒）。16 个进程同时从本地盘
+        # 加载分片权重时，两节点进入 TP scatter 的时间可能差几分钟，先到的 rank
+        # 就会拿到 "Connection refused" 然后整组通信器初始化失败。实测 60×100ms
+        # 只有约 6 秒、120×1000ms 仍出现过 4 分钟的时间差，放宽到 600×1000ms
+        # （最长约 10 分钟）作为兜底；正常跑通时这个等待根本不会触发。
+        'export NCCL_SOCKET_RETRY_CNT="${NCCL_SOCKET_RETRY_CNT:-600}"',
+        'export NCCL_SOCKET_RETRY_SLEEP_MSEC="${NCCL_SOCKET_RETRY_SLEEP_MSEC:-1000}"',
         "export PATH=/usr/local/corex/bin:/usr/local/corex/lib64/python3/dist-packages/bin:$PATH",
         "export LD_LIBRARY_PATH=/usr/local/corex/lib64",
         "export PATH=/usr/local/corex/bin:$PATH",
@@ -322,6 +329,56 @@ def check_gpus_free() -> bool:
 
     if occupied:
         print(f"\n[ERROR] 以下节点的 GPU 正在被占用: {'、'.join(occupied)}")
+        return False
+    return True
+
+
+def check_port_conflicts(fix: bool = True) -> bool:
+    """运行前检查（并可自动修复）kube-proxy 与 NCCL 临时端口的冲突。
+
+    两台机器都是 k8s 节点，kube-proxy 会对"没有后端的服务端口"下发
+    `dst-type LOCAL ... --dport N -j REJECT`。NCCL 的 bootstrap 监听口是
+    `bind(port=0)` 由内核在 `ip_local_port_range` 里随机分配的，撞上这些端口
+    就会 connect refused，`socketPollConnect` 线性退避重试，表现为训练卡死在
+    初始化（详见 udtca-config/README.md 排障一节）。
+
+    修复方式是 `sysctl net.ipv4.ip_local_reserved_ports` 把这些端口从自动分配
+    里排除——不改任何 kube 规则，也不影响别人显式 bind 这些端口。
+
+    返回 False 表示修复后仍有冲突（训练大概率会卡住），调用方应退出。
+    """
+    print("\nChecking ephemeral-port conflicts with kube-proxy REJECT rules...")
+    script_local = (Path(__file__).resolve().parent.parent
+                    / "utils" / "check_k8s_port_conflict.py")
+    script_remote = f"{REMOTE_BASE_DIR}/udtca-config/utils/check_k8s_port_conflict.py"
+    flag = " --fix" if fix else ""
+
+    commands = {
+        LOCAL_HOST: f"{sys.executable} {script_local}{flag}",
+        REMOTE_HOST: f"ssh {REMOTE_HOST} 'python3 {script_remote}{flag}'",
+    }
+
+    failed = []
+    for node, cmd in commands.items():
+        try:
+            proc = subprocess.run(cmd, shell=True, capture_output=True,
+                                  text=True, timeout=120)
+        except Exception as exc:                      # noqa: BLE001
+            print(f"  [警告] {node}: 端口冲突检查执行失败（{exc}），跳过")
+            continue
+        output = (proc.stdout + proc.stderr).strip()
+        for line in output.splitlines():
+            print(f"  {line}")
+        if proc.returncode == 1:                      # 仍有冲突
+            failed.append(node)
+        elif proc.returncode == 2:                    # 读不到 iptables，无法判断
+            print(f"  [警告] {node}: 无法读取 iptables，跳过端口冲突检查")
+        elif proc.returncode != 0:
+            print(f"  [警告] {node}: 检查脚本返回 {proc.returncode}，忽略")
+
+    if failed:
+        print(f"\n[ERROR] 以下节点仍有临时端口被 kube-proxy REJECT: {'、'.join(failed)}")
+        print("       训练可能卡在初始化；请用 root 手动执行上面的修复命令后重试。")
         return False
     return True
 
@@ -620,11 +677,19 @@ def execute_command(cmd: str, cwd: Optional[Path] = None, background: bool = Fal
         # -o pipefail 保证管道退出码还是训练进程的，不会被 tee 的成功掩盖。
         log_path = Path(log_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        bash_cmd = (f"/bin/bash -o pipefail -c {_shq(cmd)}"
-                    f" 2>&1 | tee -a {_shq(str(log_path))}")
+        # 注意 pipefail 必须包住**整条**管道（含 tee）：之前写成
+        #   bash -o pipefail -c '<cmd>' 2>&1 | tee
+        # 外层 shell 没有 pipefail，返回码取的是 tee 的 0，训练进程非 0 退出会被
+        # 悄悄当成成功（case.json 里 exit_code 也是 0）。
+        # 整条管道（含 tee）作为**一个** -c 参数交给 bash；只 quote 一次，
+        # 否则会把已经 quote 好的字符串再套一层，bash 拿到的是一个不可解析的单词。
+        # 用花括号把 cmd 收成一组再重定向：直接写 `cmd 2>&1 | tee` 时，
+        # cmd 里的 `;` / `&&` 优先级低于 `|`，前半截的输出不会进 tee。
+        pipeline = "{\n" + cmd + "\n} 2>&1 | tee -a " + str(log_path)
+        bash_cmd = f"/bin/bash -o pipefail -c {_shq(pipeline)}"
         print(f"[LOCAL {LOCAL_HOST}] 输出同时写入: {log_path}")
     else:
-        bash_cmd = f"/bin/bash -c '{cmd}'"
+        bash_cmd = f"/bin/bash -c {_shq(cmd)}"
 
     process = subprocess.Popen(bash_cmd, shell=True, cwd=cwd)
     process._log_file = None
