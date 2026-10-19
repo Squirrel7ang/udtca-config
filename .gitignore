@@ -12,3 +12,6 @@ debug_logs/
 
 # 实时指标 API 的本地依赖（--install-deps 装到这里，不进版本库）
 qwen14b/.api_deps/
+
+# 本机集群配置（从 cluster.env.example 复制，含本机 IP / 网卡，不进版本库）
+cluster.env

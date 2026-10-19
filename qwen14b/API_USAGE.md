@@ -100,6 +100,24 @@ python udtca-config/qwen14b/start_metrics_api.py --log-file /tmp/train_node0.log
 
 起起来后终端会打印一行 `run_dir`，确认指向的是本次 run（不是上一次）。
 
+### 2.3 跨机访问
+
+API 只需要在 **node 0** 上起，也只读 node 0 本地的 `run_log/`（node 1 的日志是每个
+case 跑完后才拉回来的），所以不用配 node 1 的地址：
+
+```bash
+# 监听所有网卡（默认），其他机器用 node 0 的 IP 访问
+python udtca-config/qwen14b/start_metrics_api.py --host 0.0.0.0 --port 8000
+#   http://10.31.10.13:8000/docs
+
+# 只允许本机访问
+python udtca-config/qwen14b/start_metrics_api.py --host 127.0.0.1
+```
+
+`--with-training` 拉起的 `run.py` 会继承当前 shell 的 `UDTCA_*` 变量（node0/node1
+IP、网卡、远程仓库路径），换机器时按 [`../README.md`](../README.md) 的
+「换机器 / 改 IP、网卡、目录」一节先 `source udtca-config/cluster.env` 即可。
+
 常用参数：
 
 | 参数 | 默认 | 说明 |

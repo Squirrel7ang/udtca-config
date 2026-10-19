@@ -52,10 +52,36 @@ udtca-config/
 
 | 环境变量 | 含义 | 默认 |
 |---|---|---|
-| `UDTCA_NODE0_HOST` / `UDTCA_NODE0_IP` | node 0（本机，MASTER_ADDR 指向它） | `13` / `10.31.10.13` |
-| `UDTCA_NODE1_HOST` / `UDTCA_NODE1_IP` | node 1（ssh 目标，IP 或 ssh 别名） | `10.31.10.177` |
+| `UDTCA_NODE0_HOST` | node 0 的显示名（终端输出 / `case.json` 标签，不参与连接） | `13` |
+| `UDTCA_NODE0_IP` | node 0 的 IP，写进 `MASTER_ADDR`；node 0 必须是本机 | `10.31.10.13` |
+| `UDTCA_NODE1_HOST` | node 1，`ssh` / `scp` 的连接目标（IP 或 ssh 别名） | `10.31.10.177` |
+| `UDTCA_NODE1_IP` | node 1 的 IP，用于 tc 的 iptables peer 规则 | `10.31.10.177` |
+| `UDTCA_REMOTE_BASE_DIR` | node 1 上的仓库路径，**两机必须一致** | `/data1/tangruijing/udtca` |
+| `UDTCA_NIC_IFACE` | 两机互联网卡（`NCCL_SOCKET_IFNAME` + tc） | `ens1f0` |
 | `UDTCA_CONDA_ENV` | 两侧同名的 conda 环境 | `udtca` |
-| `UDTCA_NIC_IFACE` | 两机互联网卡 | `ens1f0` |
+
+**换机器 / 改 IP、网卡、目录**：仓库里带了一份模板，复制后按需修改再 source：
+
+```bash
+cp udtca-config/cluster.env.example udtca-config/cluster.env
+vi udtca-config/cluster.env          # 改 IP、网卡名、两机仓库路径
+source udtca-config/cluster.env      # 每次开新 shell 都要 source
+
+python udtca-config/qwen14b/run.py   # 或 generate_and_run.py / start_metrics_api.py
+```
+
+这些变量是 `common/case_common.py` 在被 import 时读取一次的，必须在启动 Python
+之前 export；不设置时就是上表默认值。注意：
+
+- **`UDTCA_NODE0_IP` 必须是执行机自己的地址**。`node_rank=0` 的 torchrun 要 bind
+  `MASTER_ADDR`，写错会 `EADDRNOTAVAIL` 或两边一直干等。整套编排也只在 node 0
+  上跑，它通过 ssh 操控 node 1。
+- `UDTCA_NODE1_HOST` 要能免密 `ssh`（先用 `ssh <host> hostname` 验证），两机的
+  `UDTCA_REMOTE_BASE_DIR` 要指向同一个路径。
+- `UDTCA_NIC_IFACE` 对 POLAR 和 baseline 两条路径都生效（`NCCL_SOCKET_IFNAME`
+  统一由编排器 export，不再依赖启动脚本里的默认值）。
+- 实时指标 API 只跑在 node 0、只读 node 0 的 `run_log/`，不需要 `UDTCA_NODE1_*`；
+  `--host 0.0.0.0`（默认）即可让其他机器用 `http://<UDTCA_NODE0_IP>:8000` 访问。
 
 实时指标 API（给第三方测试平台）：`qwen14b/start_metrics_api.py`，跑在 node 0 上，
 提供 `/api/v1/metrics/latest`、`/stream`（SSE）、`/overview` 等接口。

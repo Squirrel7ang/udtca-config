@@ -176,6 +176,11 @@ SETUP_CMDS = " && ".join(
         #    训练脚本里都是 ${MASTER_ADDR:-...} 的可覆盖写法，export 出去就能生效，
         #    不用去改 experiments/qwen14b 下那些脚本。
         f"export MASTER_ADDR={LOCAL_IP}",
+        # 4.5) 互联互通网卡。生成的 POLAR 脚本里已经有 NCCL_SOCKET_IFNAME 默认值，
+        #      但仓库里现成的 baseline 脚本只写 ${NCCL_SOCKET_IFNAME:-ens1f0}，
+        #      不会读 UDTCA_NIC_IFACE。这里统一 export，两条路径都跟着环境变量走，
+        #      换网卡名时不用改脚本。
+        f"export NCCL_SOCKET_IFNAME={NIC_IFACE}",
         # 5) HF 镜像 + 清代理，不依赖任何代理工具（clash 等）
         f"export HF_ENDPOINT={HF_ENDPOINT}",
         "unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY NO_PROXY no_proxy",
