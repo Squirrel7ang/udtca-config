@@ -11,7 +11,7 @@ export COREX_TOOLKIT=/data/tianshu/20260720/corex/corex/corex-toolkit
 export CUDA_HOME="$COREX_PATH"
 export LD_LIBRARY_PATH=$COREX_TOOLKIT/ixblas/lib64:$COREX_TOOLKIT/ixinfer/lib64:$COREX_PATH/lib64:/usr/local/corex/lib64:$COREX_TOOLKIT/ixdriver/lib64:$COREX_TOOLKIT/ixccl/lib64:/usr/mpi/gcc/openmpi-4.1.7rc1/lib
 export LD_PRELOAD="$COREX_TOOLKIT/ixccl/lib64/libnccl.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
-export PYTHONPATH=/usr/local/corex/lib64/python3/dist-package
+export PYTHONPATH=/usr/local/corex/lib64/python3/dist-packages
 source /home/powerone/miniconda3/etc/profile.d/conda.sh
 conda activate udtca
 export PYTHONUNBUFFERED=1

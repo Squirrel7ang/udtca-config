@@ -34,7 +34,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PATH=/usr/local/corex/bin:/usr/local/corex/lib64/python3/dist-packages/bin:$PATH
 export LD_LIBRARY_PATH=$COREX_TOOLKIT/ixblas/lib64:$COREX_TOOLKIT/ixinfer/lib64:$COREX_PATH/lib64:/usr/local/corex/lib64:$COREX_TOOLKIT/ixdriver/lib64:$COREX_TOOLKIT/ixccl/lib64:/usr/mpi/gcc/openmpi-4.1.7rc1/lib
 export LD_PRELOAD="$COREX_TOOLKIT/ixccl/lib64/libnccl.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
-export PYTHONPATH=/usr/local/corex/lib64/python3/dist-package
+export PYTHONPATH=/usr/local/corex/lib64/python3/dist-packages
 source /home/powerone/miniconda3/etc/profile.d/conda.sh
 export PATH="/home/powerone/miniconda3/bin:$PATH"
 (conda deactivate >/dev/null 2>&1 || true)
