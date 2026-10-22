@@ -56,6 +56,23 @@ NIC_IFACE = _env("UDTCA_NIC_IFACE", "ens1f0")
 REMOTE_NIC_IFACE = _env("UDTCA_REMOTE_NIC_IFACE", NIC_IFACE)
 HF_ENDPOINT = "https://hf-mirror.com"
 
+# 这些路径各机器不一样，按「环境变量 > 第一台存在的默认位置」解析，脚本里不写死。
+def _pick_dir(*candidates: str) -> str:
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    return candidates[-1]
+
+
+# conda 安装根目录（u13/u177 在 /root/miniconda3，新机器在 /home/powerone/miniconda3）
+CONDA_ROOT = _env("UDTCA_CONDA_ROOT", "") or _pick_dir(
+    "/home/powerone/miniconda3", "/root/miniconda3"
+)
+# Corex 工具链；新机器用仓库自带的 .corex-4.5.0，老机器是 /usr/local/corex（4.4.0）
+COREX_ROOT = _env("UDTCA_COREX_PATH", "") or _pick_dir(
+    str(REPO_ROOT / ".corex-4.5.0"), "/usr/local/corex"
+)
+
 
 @dataclass(frozen=True)
 class ExperimentSpec:
@@ -139,7 +156,7 @@ SETUP_CMDS = " && ".join(
         ' case "$_flags" in *e*) set -e;; esac; case "$_flags" in *u*) set -u;; esac;'
         " unset _flags PS1; fi",
         # 2) Corex / CUDA 变量，两台强制一致
-        "export COREX_PATH=/data/tangruijing/udtca/.corex-4.5.0",
+        "export COREX_PATH=" + COREX_ROOT,
         "export COREX_TOOLKIT=/data/tianshu/20260720/corex/corex/corex-toolkit",
         'export CUDA_HOME="$COREX_PATH"',
         'export CPATH="$COREX_PATH/include:${CPATH:-}"',
@@ -160,10 +177,10 @@ SETUP_CMDS = " && ".join(
         "export PYTHONPATH=/usr/local/corex/lib64/python3/dist-package",
         "export PATH=/usr/local/corex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         # 3) conda 环境
-        "source /home/powerone/miniconda3/etc/profile.d/conda.sh",
+        "source " + CONDA_ROOT + "/etc/profile.d/conda.sh",
         # 注意必须是双引号：单引号下 $PATH 不会展开，PATH 会变成字面量字符串，
         # /usr/bin 和 /bin 就没了，连 bash 都找不到
-        'export PATH="/home/powerone/miniconda3/bin:$PATH"',
+        f'export PATH="{CONDA_ROOT}/bin:$PATH"',
         "unset __conda_setup",
         "(conda deactivate >/dev/null 2>&1 || true)",
         f"conda activate {CONDA_ENV}",
@@ -853,7 +870,7 @@ for pid in $(ls /proc 2>/dev/null); do
   [ "$pid" = "$$" ] && continue
   cmd=$(tr '\0' ' ' < /proc/"$pid"/cmdline 2>/dev/null) || continue
   case "$cmd" in
-    /home/powerone/miniconda3/envs/{conda_env}/bin/python3.10*)
+    {conda_root}/envs/{conda_env}/bin/python3.10*)
       case "$cmd" in
         *run_qwen14*_polar_dp_pp*tp.py*|*run_qwenvl*_polar_dp_pp*.py*|*/bin/torchrun*)
           kill "$pid" 2>/dev/null && killed=$((killed + 1));;
@@ -866,7 +883,9 @@ echo "$killed"
 
 def _train_kill_snippet() -> str:
     """按当前 CONDA_ENV 渲染中断清理脚本（换环境名不用改代码）。"""
-    return _TRAIN_KILL_SNIPPET_TEMPLATE.replace("{conda_env}", CONDA_ENV)
+    return (_TRAIN_KILL_SNIPPET_TEMPLATE
+            .replace("{conda_env}", CONDA_ENV)
+            .replace("{conda_root}", CONDA_ROOT))
 
 
 
@@ -1030,8 +1049,8 @@ def write_environment_info() -> Path:
         },
         "repo_path": str(REPO_ROOT),          # 两个节点上的路径相同
         "conda_env": CONDA_ENV,
-        "python": _probe(f"/home/powerone/miniconda3/envs/{CONDA_ENV}/bin/python -V"),
-        "torch": _probe(f"/home/powerone/miniconda3/envs/{CONDA_ENV}/bin/python -c "
+        "python": _probe(f"{CONDA_ROOT}/envs/{CONDA_ENV}/bin/python -V"),
+        "torch": _probe(f"{CONDA_ROOT}/envs/{CONDA_ENV}/bin/python -c "
                         "'import torch;print(torch.__version__)'"),
         "network": NETWORK,
         "parallelism": {
