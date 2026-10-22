@@ -30,7 +30,11 @@
 # =============================================================================
 set -uo pipefail
 
-REPO_ROOT=/data/tangruijing/udtca
+# 仓库根目录从脚本位置推导（本文件在 <repo>/udtca-config/qwen14b/）。
+# 不要写死 /data/tangruijing/udtca：新机器上仓库在 /data1/...，而 /data/...
+# 可能是另一份旧 clone。需要时用 UDTCA_REPO_ROOT 覆盖。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${UDTCA_REPO_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 ENTRY="$REPO_ROOT/experiments/qwen14b/run_qwen14b_polar_dp_pp_tp.py"
 
 MODE="${MODE:-baseline}"
