@@ -26,6 +26,7 @@ from case_common import (
     LOCAL_HOST,
     LOCAL_IP,
     NIC_IFACE,
+    REMOTE_NIC_IFACE,
     REMOTE_BASE_DIR,
     REMOTE_HOST,
     SETUP_CMDS,
@@ -218,6 +219,7 @@ def write_train_script(
     entry_script: str,
     master_port: str = "29500",
     hf_endpoint: str = HF_ENDPOINT,
+    nic_iface: str = NIC_IFACE,
 ) -> None:
     """渲染并写出一份该实验的 torchrun 启动脚本。
 
@@ -248,7 +250,7 @@ MASTER_ADDR="${{MASTER_ADDR:-{LOCAL_IP}}}"
 MASTER_PORT="${{MASTER_PORT:-{master_port}}}"
 NNODES="${{NNODES:-2}}"
 NPROC_PER_NODE="${{NPROC_PER_NODE:-16}}"
-NCCL_SOCKET_IFNAME="${{NCCL_SOCKET_IFNAME:-{NIC_IFACE}}}"
+NCCL_SOCKET_IFNAME="${{NCCL_SOCKET_IFNAME:-{nic_iface}}}"
 NCCL_IB_DISABLE="${{NCCL_IB_DISABLE:-1}}"
 
 export NCCL_ASYNC_ERROR_HANDLING="${{NCCL_ASYNC_ERROR_HANDLING:-1}}"
@@ -350,9 +352,9 @@ def run_polar_case(
 
     print("\n1. Generating training scripts...")
     write_train_script(script_0_path, 0, launch_0, case_dir, spec.entry_script,
-                       spec.master_port)
+                       spec.master_port, nic_iface=NIC_IFACE)
     write_train_script(script_1_path, 1, launch_1, case_dir, spec.entry_script,
-                       spec.master_port)
+                       spec.master_port, nic_iface=REMOTE_NIC_IFACE)
     print(f"   Generated: {script_0_path}")
     print(f"   Generated: {script_1_path}")
 

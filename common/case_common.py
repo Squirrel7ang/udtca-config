@@ -53,6 +53,7 @@ REMOTE_IP = _env("UDTCA_NODE1_IP", "10.31.10.177")
 REMOTE_BASE_DIR = _env("UDTCA_REMOTE_BASE_DIR", "/data1/tangruijing/udtca")
 CONDA_ENV = _env("UDTCA_CONDA_ENV", "udtca")
 NIC_IFACE = _env("UDTCA_NIC_IFACE", "ens1f0")
+REMOTE_NIC_IFACE = _env("UDTCA_REMOTE_NIC_IFACE", NIC_IFACE)
 HF_ENDPOINT = "https://hf-mirror.com"
 
 
@@ -138,7 +139,8 @@ SETUP_CMDS = " && ".join(
         ' case "$_flags" in *e*) set -e;; esac; case "$_flags" in *u*) set -u;; esac;'
         " unset _flags PS1; fi",
         # 2) Corex / CUDA 变量，两台强制一致
-        "export COREX_PATH=/usr/local/corex-4.4.0",
+        "export COREX_PATH=/data/tangruijing/udtca/.corex-4.5.0",
+        "export COREX_TOOLKIT=/data/tianshu/20260720/corex/corex/corex-toolkit",
         'export CUDA_HOME="$COREX_PATH"',
         'export CPATH="$COREX_PATH/include:${CPATH:-}"',
         'export LIBRARY_PATH="$COREX_PATH/lib64:${LIBRARY_PATH:-}"',
@@ -153,15 +155,15 @@ SETUP_CMDS = " && ".join(
         'export NCCL_SOCKET_RETRY_CNT="${NCCL_SOCKET_RETRY_CNT:-600}"',
         'export NCCL_SOCKET_RETRY_SLEEP_MSEC="${NCCL_SOCKET_RETRY_SLEEP_MSEC:-1000}"',
         "export PATH=/usr/local/corex/bin:/usr/local/corex/lib64/python3/dist-packages/bin:$PATH",
-        "export LD_LIBRARY_PATH=/usr/local/corex/lib64",
+        "export LD_LIBRARY_PATH=$COREX_TOOLKIT/ixblas/lib64:$COREX_TOOLKIT/ixinfer/lib64:$COREX_PATH/lib64:/usr/local/corex/lib64:$COREX_TOOLKIT/ixdriver/lib64:$COREX_TOOLKIT/ixccl/lib64:/usr/mpi/gcc/openmpi-4.1.7rc1/lib",
         "export PATH=/usr/local/corex/bin:$PATH",
         "export PYTHONPATH=/usr/local/corex/lib64/python3/dist-package",
         "export PATH=/usr/local/corex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         # 3) conda 环境
-        "source /root/miniconda3/etc/profile.d/conda.sh",
+        "source /home/powerone/miniconda3/etc/profile.d/conda.sh",
         # 注意必须是双引号：单引号下 $PATH 不会展开，PATH 会变成字面量字符串，
         # /usr/bin 和 /bin 就没了，连 bash 都找不到
-        'export PATH="/root/miniconda3/bin:$PATH"',
+        'export PATH="/home/powerone/miniconda3/bin:$PATH"',
         "unset __conda_setup",
         "(conda deactivate >/dev/null 2>&1 || true)",
         f"conda activate {CONDA_ENV}",
@@ -249,10 +251,11 @@ GPU_MEMORY_THRESHOLD_MIB = 256
 #   退出码 0 = 空闲，1 = 被占用，2 = 找不到 SMI 工具
 GPU_CHECK_SNIPPET = r"""
 THRESHOLD=__THRESHOLD__
+export LD_LIBRARY_PATH=/usr/local/corex/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
 SMI=""
 for c in ixsmi /usr/local/bin/ixsmi /usr/local/corex/bin/ixsmi \
-         /usr/local/corex-4.4.0/bin/ixsmi /usr/local/corex-4.5.0/bin/ixsmi nvidia-smi; do
+         /data/tangruijing/udtca/.corex-4.5.0/bin/ixsmi /usr/local/corex-4.5.0/bin/ixsmi nvidia-smi; do
   if command -v "$c" >/dev/null 2>&1; then SMI="$c"; break; fi
 done
 if [ -z "$SMI" ]; then
@@ -544,7 +547,7 @@ def read_nic_bytes_local(iface: str = NIC_IFACE):
         return None
 
 
-def read_nic_bytes_remote(iface: str = NIC_IFACE):
+def read_nic_bytes_remote(iface: str = REMOTE_NIC_IFACE):
     """node 1 上网卡的累计 (rx_bytes, tx_bytes)；读不到返回 None。"""
     cmd = (
         f"ssh {REMOTE_HOST} 'cat /sys/class/net/{iface}/statistics/rx_bytes; "
@@ -561,14 +564,15 @@ def read_nic_bytes_remote(iface: str = NIC_IFACE):
         return None
 
 
-def inter_node_tx_bytes(iface: str = NIC_IFACE):
+def inter_node_tx_bytes(iface: str = NIC_IFACE,
+                        remote_iface: str = REMOTE_NIC_IFACE):
     """两机间链路上累计"已发送"的字节数（node0 的 tx + node1 的 tx）。
 
     同一批包，node0 的 tx 就是 node1 的 rx，反之亦然。把两个节点的 tx 相加，
     正好把两个方向各数一次，不会像 (rx+tx) 那样重复计数。任一侧读不到就返回 None。
     """
     local = read_nic_bytes_local(iface)
-    remote = read_nic_bytes_remote(iface)
+    remote = read_nic_bytes_remote(remote_iface)
     if local is None or remote is None:
         return None
     return local[1] + remote[1]
@@ -849,7 +853,7 @@ for pid in $(ls /proc 2>/dev/null); do
   [ "$pid" = "$$" ] && continue
   cmd=$(tr '\0' ' ' < /proc/"$pid"/cmdline 2>/dev/null) || continue
   case "$cmd" in
-    /root/miniconda3/envs/{conda_env}/bin/python3.10*)
+    /home/powerone/miniconda3/envs/{conda_env}/bin/python3.10*)
       case "$cmd" in
         *run_qwen14*_polar_dp_pp*tp.py*|*run_qwenvl*_polar_dp_pp*.py*|*/bin/torchrun*)
           kill "$pid" 2>/dev/null && killed=$((killed + 1));;
@@ -1026,8 +1030,8 @@ def write_environment_info() -> Path:
         },
         "repo_path": str(REPO_ROOT),          # 两个节点上的路径相同
         "conda_env": CONDA_ENV,
-        "python": _probe(f"/root/miniconda3/envs/{CONDA_ENV}/bin/python -V"),
-        "torch": _probe(f"/root/miniconda3/envs/{CONDA_ENV}/bin/python -c "
+        "python": _probe(f"/home/powerone/miniconda3/envs/{CONDA_ENV}/bin/python -V"),
+        "torch": _probe(f"/home/powerone/miniconda3/envs/{CONDA_ENV}/bin/python -c "
                         "'import torch;print(torch.__version__)'"),
         "network": NETWORK,
         "parallelism": {
