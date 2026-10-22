@@ -109,12 +109,24 @@ CACHE_DIR="$REPO_ROOT/run_log/single_cache"
 mkdir -p "$CASE_DIR/logs" "$CACHE_DIR"
 
 # ---- 占卡检查（在改 LD_LIBRARY_PATH 前用系统 ixsmi）----
-if [ "${SKIP_PRECHECK:-0}" != "1" ] && ! /usr/bin/ixsmi 2>&1 | grep -q "No running processes found"; then
-  echo "ERROR: GPU 上已有进程，退出" | tee -a "$CASE_DIR/precheck.log"
-  /usr/bin/ixsmi | tee -a "$CASE_DIR/precheck.log"
-  exit 4
+# ixsmi 的位置随机型不同：部分机器在 /usr/bin，部分只在 corex 目录下。
+IXSMI_BIN="${IXSMI_BIN:-}"
+if [ -z "$IXSMI_BIN" ]; then
+  for c in "$(command -v ixsmi 2>/dev/null)" /usr/bin/ixsmi /usr/local/corex/bin/ixsmi; do
+    [ -n "$c" ] && [ -x "$c" ] && { IXSMI_BIN="$c"; break; }
+  done
 fi
-/usr/bin/ixsmi > "$CASE_DIR/ixsmi_before.log" 2>&1
+if [ "${SKIP_PRECHECK:-0}" != "1" ]; then
+  if [ -z "$IXSMI_BIN" ]; then
+    echo "WARN: 找不到 ixsmi，跳过占卡检查（如需强制检查请设置 IXSMI_BIN）" \
+      | tee -a "$CASE_DIR/precheck.log"
+  elif ! "$IXSMI_BIN" 2>&1 | grep -q "No running processes found"; then
+    echo "ERROR: GPU 上已有进程，退出" | tee -a "$CASE_DIR/precheck.log"
+    "$IXSMI_BIN" | tee -a "$CASE_DIR/precheck.log"
+    exit 4
+  fi
+fi
+[ -n "$IXSMI_BIN" ] && "$IXSMI_BIN" > "$CASE_DIR/ixsmi_before.log" 2>&1
 
 {
   echo "# PRE_RUN $TS"
