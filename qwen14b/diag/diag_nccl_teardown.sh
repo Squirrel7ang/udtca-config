@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # 诊断：NCCL 运行中 SIGTERM 是否会把 Corex GPU 打成 MMU 故障
+# !!! 危险：term 模式会故意在 collective 在途时发 SIGTERM（会打出 XID 24）。
+# 只在专用/待重启的机器上跑，不要在有人用的共享机器上随手执行。
 # 用法: bash diag_nccl_teardown.sh normal|term
 # 只使用 TEST_DEVICES（默认 2,3，两张健康 die）
 set -uo pipefail
@@ -60,7 +62,7 @@ journalctl -k -n 3 > "$CASE_DIR/kernel_before.log" 2>&1 || true
 
 export TEST_DEVICES TEST_MODE="$MODE"
 torchrun --nproc_per_node=2 --master_port="${MASTER_PORT:-29641}" \
-  "$REPO_ROOT/udtca-config/qwen14b/diag_nccl_teardown.py" > "$CASE_DIR/train.log" 2>&1 &
+  "$REPO_ROOT/udtca-config/qwen14b/diag/diag_nccl_teardown.py" > "$CASE_DIR/train.log" 2>&1 &
 TPID=$!
 echo "torchrun pid=$TPID"
 

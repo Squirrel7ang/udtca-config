@@ -23,17 +23,39 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
   journalctl -k -b 2>&1 | grep -iE "XID|mmu|va space" || echo none
 } > "$OUT/baseline.log" 2>&1
 
+# 只等待，不发任何信号：单卡 12s 没结束就标记 WEDGED，进程保留给人工处理
+# （杀掉在途的 GPU 进程可能把 die 打挂，见 XID 24 的经验）。
+PIDS=()
+DEVS=()
 for dev in $(seq 0 15); do
   (
-    CUDA_DEVICE_MAX_CONNECTIONS=1 timeout -k 3 12 python -c "import torch; torch.cuda.set_device($dev); x=torch.ones(8,device='cuda'); torch.cuda.synchronize(); print('OK', x.sum().item())" > "$OUT/dev${dev}.log" 2>&1
+    CUDA_DEVICE_MAX_CONNECTIONS=1 python -c "import torch; torch.cuda.set_device($dev); x=torch.ones(8,device='cuda'); torch.cuda.synchronize(); print('OK', x.sum().item())" > "$OUT/dev${dev}.log" 2>&1
     echo "$?" > "$OUT/dev${dev}.rc"
   ) &
+  PIDS+=("$!")
+  DEVS+=("$dev")
 done
-wait
 
-for dev in $(seq 0 15); do
-  rc="$(cat "$OUT/dev${dev}.rc" 2>/dev/null || echo 255)"
-  msg="$(tail -1 "$OUT/dev${dev}.log" 2>/dev/null)"
+DEADLINE=$((SECONDS + 12))
+while :; do
+  alive=0
+  for pid in "${PIDS[@]}"; do
+    kill -0 "$pid" 2>/dev/null && alive=$((alive + 1))
+  done
+  [ "$alive" -eq 0 ] && break
+  [ "$SECONDS" -ge "$DEADLINE" ] && break
+  sleep 0.2
+done
+
+for i in "${!DEVS[@]}"; do
+  dev="${DEVS[$i]}"
+  if [ -f "$OUT/dev${dev}.rc" ]; then
+    rc="$(cat "$OUT/dev${dev}.rc")"
+    msg="$(tail -1 "$OUT/dev${dev}.log" 2>/dev/null)"
+  else
+    rc="WEDGED"
+    msg="no result in 12s; probe pid=${PIDS[$i]} left running (not killed)"
+  fi
   echo "dev$dev rc=$rc :: $msg"
 done | tee "$OUT/health.log"
 
