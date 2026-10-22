@@ -79,6 +79,13 @@ else
   METHOD_ARGS+=(--method none)
 fi
 
+# 只打印参数、不启动训练：DRY_RUN=1 MODE=xxx bash run_single_node.sh
+if [ "${DRY_RUN:-0}" = "1" ]; then
+  echo "MODE=$MODE POLAR_ON=$POLAR_ON QUANT_ON=$QUANT_ON"
+  echo "ARGS=${METHOD_ARGS[*]}"
+  exit 0
+fi
+
 # ---- 拓扑检查：DP = NPROC / (PP*TP) ----
 if [ $((PP_SIZE * TP_SIZE)) -eq 0 ] || [ $((NPROC_PER_NODE % (PP_SIZE * TP_SIZE))) -ne 0 ]; then
   echo "ERROR: 拓扑不整除: NPROC=$NPROC_PER_NODE PP=$PP_SIZE TP=$TP_SIZE" >&2
