@@ -2,25 +2,28 @@
 # =============================================================================
 # Qwen2.5-14B 训练启动器 —— 仅用于【单机】
 #
-#   单机 + baseline (DDP)         : MODE=baseline  GPUS=16 bash run_single_node.sh
-#   单机 + polar (bitscom 2bit)   : MODE=polar     GPUS=16 bash run_single_node.sh
-#   单机 + polar (dense 通信)     : MODE=polar_dense GPUS=16 bash run_single_node.sh
-#   单机 8 卡                     : GPUS=8 ...
+# 2x2 实验矩阵（POLAR 提前 DP 同步 × 是否量化）：
+#   MODE=baseline     POLAR off, dense     —— DDP baseline
+#   MODE=polar_dense  POLAR on,  dense     —— 与 baseline 的差别只有 POLAR
+#   MODE=bitscom      POLAR off, bitscom   —— 与 baseline 的差别只有量化
+#   MODE=mixed        POLAR on,  bitscom   —— 与 polar_dense 的差别只有量化
+#
+#   单机 8 卡 : GPUS=8 ...
 #
 #   双机（powerone1 + powerone2）不走这个脚本：请用 qwen14b/run.py
 #   （orchestrator 会按 config 自动拉起两台机器）。本脚本只连 127.0.0.1。
 #
 # 默认拓扑（PP*TP*DP = NPROC）：
-#   GPUS=16 -> PP=4, TP=2, DP=2
+#   GPUS=16 -> PP=8, TP=1, DP=2
 #   GPUS=8  -> PP=2, TP=2, DP=2
 #   DP=1 的旧配置（PP=8,TP=2）需显式传 PP_SIZE=8。
 #
 # 常用覆盖项：
-#   MODE=baseline|polar|bitscom|polar_dense   GPUS=16|8
+#   MODE=baseline|polar_dense|bitscom|mixed   GPUS=16|8
 #   PP_SIZE TP_SIZE NPROC_PER_NODE CUDA_VISIBLE_DEVICES
 #   MAX_STEPS MICRO_BATCHES SEQ_LEN DATASET_CONFIG MASTER_PORT CASE_DIR
 #   COMM_TIMING POLAR_MAX_INFLIGHT SKIP_PRECHECK=1
-#   UDTCA_COMM_WATCHDOG_S（默认 60；自动回滚，设 0 关闭）
+#   UDTCA_COMM_WATCHDOG_S（默认 300；自动回滚，设 0 关闭）
 #
 # 产出：$CASE_DIR（默认 run_log/single_qwen14b_<mode>_g<GPUS>_<时间戳>）
 #   train.log  nccl.*.log  PRE_RUN.md  ixsmi_before.log  EXIT_CODE
@@ -48,24 +51,33 @@ TP_SIZE="${TP_SIZE:-$DEF_TP}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-$GPUS}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$(seq -s, 0 $((GPUS - 1)))}"
 
+# 2x2 矩阵只由两个开关决定；其余参数在四种模式下完全一致。
 case "$MODE" in
-  baseline)
-    METHOD_ARGS=(--using-polar false --baseline-mode manual --polar-hook none --method none --comm-timing 0)
-    RUN_LABEL=baseline_ddp_single ;;
-  polar|bitscom)
-    METHOD_ARGS=(--using-polar true --polar-hook ef_lowmem --method bitscom --bitwidth 2
-                 --comm-timing "${COMM_TIMING:-8}" --polar-bucket-numel 64000000
-                 --polar-max-inflight-buckets "${POLAR_MAX_INFLIGHT:-1}")
-    RUN_LABEL=polar_bitscom_single ;;
-  polar_dense)
-    METHOD_ARGS=(--using-polar true --polar-hook ef_lowmem --method none
-                 --comm-timing "${COMM_TIMING:-8}" --polar-bucket-numel 64000000
-                 --polar-max-inflight-buckets "${POLAR_MAX_INFLIGHT:-1}")
-    RUN_LABEL=polar_dense_single ;;
+  baseline)    POLAR_ON=0; QUANT_ON=0; RUN_LABEL=baseline_ddp_single ;;
+  polar_dense) POLAR_ON=1; QUANT_ON=0; RUN_LABEL=polar_dense_single ;;
+  bitscom)     POLAR_ON=0; QUANT_ON=1; RUN_LABEL=bitscom_quant_single ;;
+  mixed|polar) POLAR_ON=1; QUANT_ON=1; RUN_LABEL=polar_bitscom_single ;;
   *)
-    echo "ERROR: 未知 MODE=$MODE（可选 baseline|polar|bitscom|polar_dense）" >&2
+    echo "ERROR: 未知 MODE=$MODE（可选 baseline|polar_dense|bitscom|mixed）" >&2
     exit 2 ;;
 esac
+
+METHOD_ARGS=(--baseline-mode manual)
+if [ "$POLAR_ON" = "1" ]; then
+  # POLAR：预测式提前 DP 同步。dense/bitscom 两臂这里完全相同。
+  METHOD_ARGS+=(--using-polar true --polar-hook ef_lowmem
+                --comm-timing "${COMM_TIMING:-8}"
+                --polar-bucket-numel 64000000
+                --polar-max-inflight-buckets "${POLAR_MAX_INFLIGHT:-1}")
+else
+  METHOD_ARGS+=(--using-polar false --polar-hook none --comm-timing 0)
+fi
+if [ "$QUANT_ON" = "1" ]; then
+  # 量化：梯度同步走 bitscom lowbit 后端（2bit），其余不变。
+  METHOD_ARGS+=(--method bitscom --bitwidth "${BITWIDTH:-2}")
+else
+  METHOD_ARGS+=(--method none)
+fi
 
 # ---- 拓扑检查：DP = NPROC / (PP*TP) ----
 if [ $((PP_SIZE * TP_SIZE)) -eq 0 ] || [ $((NPROC_PER_NODE % (PP_SIZE * TP_SIZE))) -ne 0 ]; then
@@ -96,6 +108,7 @@ fi
 {
   echo "# PRE_RUN $TS"
   echo "- topology: SINGLE-NODE GPUs=$GPUS DP=$DP_SIZE PP=$PP_SIZE TP=$TP_SIZE MODE=$MODE"
+  echo "- matrix: POLAR_ON=$POLAR_ON QUANT_ON=$QUANT_ON (bitscom bitwidth=${BITWIDTH:-2})"
   echo "- devices: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
   echo "- host: $(hostname) uptime: $(uptime -p)"
   echo "- xid_since_boot: $(journalctl -k -b 2>/dev/null | grep -icE 'xid|mmu page fault|va space')"
@@ -110,7 +123,8 @@ if [ -f ~/.bashrc ]; then
   case "$_flags" in *e*) set -e;; esac; case "$_flags" in *u*) set -u;; esac
   unset _flags PS1
 fi
-export COREX_PATH=/data/tangruijing/udtca/.corex-4.5.0
+# /usr/local/corex 指向本机实际 Corex 版本（当前集群 4.4.0，新机器 4.5.0）
+export COREX_PATH="${UDTCA_COREX_PATH:-/usr/local/corex}"
 export COREX_TOOLKIT=/data/tianshu/20260720/corex/corex/corex-toolkit
 export CUDA_HOME="$COREX_PATH"
 export CPATH="$COREX_PATH/include:${CPATH:-}"
@@ -122,10 +136,19 @@ export NCCL_SOCKET_RETRY_CNT="${NCCL_SOCKET_RETRY_CNT:-600}"
 export NCCL_SOCKET_RETRY_SLEEP_MSEC="${NCCL_SOCKET_RETRY_SLEEP_MSEC:-1000}"
 export PATH=/usr/local/corex/bin:/usr/local/corex/lib64/python3/dist-packages/bin:$PATH
 export LD_LIBRARY_PATH=$COREX_TOOLKIT/ixblas/lib64:$COREX_TOOLKIT/ixinfer/lib64:$COREX_PATH/lib64:/usr/local/corex/lib64:$COREX_TOOLKIT/ixdriver/lib64:$COREX_TOOLKIT/ixccl/lib64:/usr/mpi/gcc/openmpi-4.1.7rc1/lib
-export LD_PRELOAD="$COREX_TOOLKIT/ixccl/lib64/libnccl.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
+if [ -e "$COREX_TOOLKIT/ixccl/lib64/libnccl.so.2" ]; then
+  export LD_PRELOAD="$COREX_TOOLKIT/ixccl/lib64/libnccl.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
 export PYTHONPATH=/usr/local/corex/lib64/python3/dist-package
-source /home/powerone/miniconda3/etc/profile.d/conda.sh
-export PATH="/home/powerone/miniconda3/bin:$PATH"
+# conda 根目录按机器探测，兼容 powerone（/home/powerone）和当前机器（/root）
+CONDA_ROOT="${UDTCA_CONDA_ROOT:-}"
+if [ -z "$CONDA_ROOT" ]; then
+  for c in /root/miniconda3 /home/powerone/miniconda3; do
+    [ -d "$c" ] && { CONDA_ROOT="$c"; break; }
+  done
+fi
+source "${CONDA_ROOT:?找不到 conda 根目录，请设置 UDTCA_CONDA_ROOT}/etc/profile.d/conda.sh"
+export PATH="$CONDA_ROOT/bin:$PATH"
 (conda deactivate >/dev/null 2>&1 || true)
 conda activate udtca
 export PYTHONUNBUFFERED=1
@@ -145,9 +168,9 @@ export TORCH_DISABLE_ADDR2LINE=1
 export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-off}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-0}"
 export TORCH_NCCL_ENABLE_MONITORING="${TORCH_NCCL_ENABLE_MONITORING:-0}"
-export UDTCA_COMM_WATCHDOG_S="${UDTCA_COMM_WATCHDOG_S:-60}"
-export UDTCA_REVOKE_QUIESCE_S="${UDTCA_REVOKE_QUIESCE_S:-20}"
-export UDTCA_REVOKE_BARRIER_S="${UDTCA_REVOKE_BARRIER_S:-20}"
+export UDTCA_COMM_WATCHDOG_S="${UDTCA_COMM_WATCHDOG_S:-300}"
+export UDTCA_REVOKE_QUIESCE_S="${UDTCA_REVOKE_QUIESCE_S:-10}"
+export UDTCA_REVOKE_BARRIER_S="${UDTCA_REVOKE_BARRIER_S:-5}"
 # 手动触发回滚用的停止文件；默认不设，避免上次残留文件误触发。
 export UDTCA_REVOKE_FILE="${UDTCA_REVOKE_FILE:-}"
 export TORCH_NCCL_DUMP_ON_TIMEOUT=1
@@ -158,7 +181,7 @@ export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_DEBUG_FILE="$CASE_DIR/logs/nccl.%h.%p.log"
 
 echo "=== [SINGLE-NODE] qwen14b start $(date -Is)" | tee -a "$CASE_DIR/train.log"
-echo "    mode=$MODE GPUs=$GPUS DP=$DP_SIZE PP=$PP_SIZE TP=$TP_SIZE" | tee -a "$CASE_DIR/train.log"
+echo "    mode=$MODE POLAR_ON=$POLAR_ON QUANT_ON=$QUANT_ON GPUs=$GPUS DP=$DP_SIZE PP=$PP_SIZE TP=$TP_SIZE" | tee -a "$CASE_DIR/train.log"
 echo "    steps=$MAX_STEPS micro_batches=$MICRO_BATCHES seq_len=$SEQ_LEN" | tee -a "$CASE_DIR/train.log"
 echo "    case_dir=$CASE_DIR" | tee -a "$CASE_DIR/train.log"
 echo "    watchdog=${UDTCA_COMM_WATCHDOG_S}s (0=off)" | tee -a "$CASE_DIR/train.log"

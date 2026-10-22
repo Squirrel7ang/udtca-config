@@ -20,7 +20,7 @@ cd /data/tangruijing/udtca/udtca-config/qwen14b
 MODE=baseline GPUS=16 bash run_single_node.sh
 
 # 单机 16 卡，POLAR + bitscom 2bit
-MODE=polar GPUS=16 bash run_single_node.sh
+MODE=mixed GPUS=16 bash run_single_node.sh
 
 # 单机 8 卡（例如只用 8~15 卡）
 MODE=polar GPUS=8 CUDA_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 bash run_single_node.sh
@@ -28,11 +28,24 @@ MODE=polar GPUS=8 CUDA_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 bash run_single_nod
 
 ### 模式（MODE）
 
-| MODE | 含义 | 关键参数 |
-|---|---|---|
-| `baseline`（默认） | DDP baseline，不用 POLAR | `--using-polar false --baseline-mode manual --method none` |
-| `polar` / `bitscom` | POLAR + bitscom 2bit 低比特 DP 通信 | `--using-polar true --polar-hook ef_lowmem --method bitscom --bitwidth 2` |
-| `polar_dense` | POLAR 框架 + dense 通信（对照组） | `--using-polar true --method none` |
+四个模式是一个 2x2（POLAR 是否开启 × DP 梯度同步是否量化）。脚本里只有
+`POLAR_ON` / `QUANT_ON` 两个开关，其余参数四种模式完全一致：
+
+| MODE | POLAR | 量化 | 与谁只差一个开关 |
+|---|---|---|---|
+| `baseline`（默认） | off | off | — |
+| `polar_dense` | on | off | 与 baseline 只差 POLAR |
+| `bitscom` | off | on | 与 baseline 只差量化 |
+| `mixed`（`polar` 是别名） | on | on | 与 polar_dense 只差量化 |
+
+- POLAR on：`--using-polar true --polar-hook ef_lowmem --comm-timing 8 --polar-bucket-numel 64000000 --polar-max-inflight-buckets 1`
+- POLAR off：`--using-polar false --polar-hook none --comm-timing 0`
+- 量化 on：`--method bitscom --bitwidth 2`（梯度同步走 lowbit 后端）
+- 量化 off：`--method none`
+
+`bitscom` 的梯度同步与 `baseline` 走同一个 `_allreduce_dp_grads_`：
+逐参数 SUM + 除以 DP size，只有传输后端（`dist.all_reduce` vs
+`lowbit_group.all_reduce`）不同。
 
 ### GPU 数 / 拓扑
 
@@ -55,7 +68,7 @@ UDTCA_COMM_WATCHDOG_S=60 \
 bash run_single_node.sh
 ```
 
-- `UDTCA_COMM_WATCHDOG_S`：自动回滚超时（默认 60s；设 `0` 关闭，卡死时就只能人工处理）。
+- `UDTCA_COMM_WATCHDOG_S`：自动回滚超时（默认 300s；设 `0` 关闭，卡死时就只能人工处理）。
 - `SKIP_PRECHECK=1`：跳过 `ixsmi` 占卡检查（不建议）。
 
 ### 产出（`$CASE_DIR`）
