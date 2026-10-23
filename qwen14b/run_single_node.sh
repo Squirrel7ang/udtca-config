@@ -77,6 +77,13 @@ TS="$(date +%Y%m%d_%H%M%S)"
 CASE_DIR="${CASE_DIR:-$REPO_ROOT/run_log/single_qwen14b_${MODE}_g${GPUS}_${TS}}"
 mkdir -p "$CASE_DIR/logs"
 
+# 每次运行的控制台输出额外落一份到 $LOG_DIR，省掉外面手写 `| tee`。
+# 默认是仓库下的 log/（不是根目录 /udtca/log：那需要 root 才能创建）。
+LOG_DIR="${LOG_DIR:-$REPO_ROOT/log}"
+mkdir -p "$LOG_DIR"
+RUN_LOG="$LOG_DIR/$(basename "$CASE_DIR").log"
+TEE=(tee -a "$CASE_DIR/train.log" "$RUN_LOG")
+
 # 占卡检查。ixsmi 位置随机型不同，先找一遍。
 IXSMI_BIN="${IXSMI_BIN:-}"
 if [ -z "$IXSMI_BIN" ]; then
@@ -84,7 +91,10 @@ if [ -z "$IXSMI_BIN" ]; then
     [ -n "$c" ] && [ -x "$c" ] && { IXSMI_BIN="$c"; break; }
   done
 fi
-if [ "${SKIP_PRECHECK:-0}" != "1" ]; then
+# powerone1 上 ixsmi 的读数不可信（8 张物理卡 16 个芯粒，掉过卡后设备号错位，
+# 永远看不到 "No running processes found"），在这台机器上默认跳过，免得每次都要
+# 手动带 SKIP_PRECHECK=1；占卡情况由用户看 NOTE 文件和 ixsmi 原始输出确认。
+if [ "${SKIP_PRECHECK:-$(case "$(hostname)" in powerone*) echo 1;; *) echo 0;; esac)}" != "1" ]; then
   if [ -z "$IXSMI_BIN" ]; then
     echo "WARN: 找不到 ixsmi，跳过占卡检查（可设 IXSMI_BIN）" >&2
   elif ! "$IXSMI_BIN" 2>&1 | grep -q "No running processes found"; then
@@ -148,6 +158,10 @@ fi
 export NCCL_SOCKET_IFNAME
 unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY NO_PROXY no_proxy
 export HF_ENDPOINT=https://hf-mirror.com
+# HF 的元数据 HEAD 请求默认没有超时：镜像不回包也不断链时会永久挂住
+# （2026-10-23 在 powerone1 上卡了 11 分钟，模型都没开始建）。给个上限。
+export HF_HUB_ETAG_TIMEOUT="${HF_HUB_ETAG_TIMEOUT:-15}"
+export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-30}"
 export CUDA_VISIBLE_DEVICES
 
 # 诊断日志 + 卡死自动回滚（revoke 后各 rank 自行退出）
@@ -158,7 +172,7 @@ export TORCH_DISABLE_ADDR2LINE=1
 export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-off}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-0}"
 export TORCH_NCCL_ENABLE_MONITORING="${TORCH_NCCL_ENABLE_MONITORING:-0}"
-export UDTCA_COMM_WATCHDOG_S="${UDTCA_COMM_WATCHDOG_S:-300}"
+export UDTCA_COMM_WATCHDOG_S="${UDTCA_COMM_WATCHDOG_S:-60}"
 export UDTCA_REVOKE_QUIESCE_S="${UDTCA_REVOKE_QUIESCE_S:-10}"
 export UDTCA_REVOKE_BARRIER_S="${UDTCA_REVOKE_BARRIER_S:-5}"
 export UDTCA_REVOKE_FILE="${UDTCA_REVOKE_FILE:-}"
@@ -169,9 +183,15 @@ export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_DEBUG_FILE="$CASE_DIR/logs/nccl.%h.%p.log"
 
-echo "=== [SINGLE-NODE] qwen14b start $(date -Is)" | tee -a "$CASE_DIR/train.log"
-echo "    mode=$MODE POLAR_ON=$POLAR_ON QUANT_ON=$QUANT_ON GPUs=$GPUS DP=$DP_SIZE PP=$PP_SIZE TP=$TP_SIZE" | tee -a "$CASE_DIR/train.log"
-echo "    case_dir=$CASE_DIR" | tee -a "$CASE_DIR/train.log"
+echo "=== [SINGLE-NODE] qwen14b start $(date -Is)" | "${TEE[@]}"
+echo "    mode=$MODE POLAR_ON=$POLAR_ON QUANT_ON=$QUANT_ON GPUs=$GPUS DP=$DP_SIZE PP=$PP_SIZE TP=$TP_SIZE" | "${TEE[@]}"
+echo "    case_dir=$CASE_DIR" | "${TEE[@]}"
+echo "    run_log=$RUN_LOG" | "${TEE[@]}"
+
+# 崩溃残留的 0 字节缓存：entry 里用 cache_path.exists() 判断，0 字节也算存在，
+# 于是跳过重建、随后 torch.load 直接失败。正常缓存有几十 MB，清掉不算误伤。
+find "$REPO_ROOT/experiments/qwen14b/cache" -maxdepth 1 \
+  -name '*_labels_unshifted_v2.pt' -size 0 -delete 2>/dev/null || true
 
 cd "$REPO_ROOT"
 torchrun \
@@ -200,7 +220,7 @@ torchrun \
   --debug-nan-steps 2 \
   --save-dir "$CASE_DIR/ckpt" \
   --step-log-dir "$CASE_DIR/step_csv" \
-  2>&1 | tee -a "$CASE_DIR/train.log"
+  2>&1 | "${TEE[@]}"
 RC=${PIPESTATUS[0]}
-echo "EXIT_CODE=$RC" | tee -a "$CASE_DIR/EXIT_CODE" "$CASE_DIR/train.log"
+echo "EXIT_CODE=$RC" | tee -a "$CASE_DIR/EXIT_CODE" "$CASE_DIR/train.log" "$RUN_LOG"
 exit "$RC"
