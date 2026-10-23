@@ -23,10 +23,10 @@ MAX_STEPS="${MAX_STEPS:-3}"
 MICRO_BATCHES="${MICRO_BATCHES:-16}"
 SEQ_LEN="${SEQ_LEN:-256}"
 MASTER_PORT="${MASTER_PORT:-29630}"
-# 数据集默认用 entry 的默认值（全量 fineweb），缩小范围时用 DATASET_CONFIG /
-# DATASET_FILES 覆盖。只给 DATASET_CONFIG 省不掉列目录（datasets 用的是卡片里
-# 第一个 config），挂死由 entry 的 httpx 读超时 + 重试兜底。
-DATASET_CONFIG="${DATASET_CONFIG:-}"
+# 数据集默认用 fineweb 的 sample-10BT（10B token 子集，冒烟足够）。entry 会按
+# 这个 config 去卡片里取 data_files，只列一个小目录；不用再递归扫整个仓库。
+# 换数据集用 DATASET_CONFIG/DATASET_FILES，或直接改这里。
+DATASET_CONFIG="${DATASET_CONFIG-sample-10BT}"
 DATASET_FILES="${DATASET_FILES:-}"
 
 DS_ARGS=(--dataset-name-or-path HuggingFaceFW/fineweb)
