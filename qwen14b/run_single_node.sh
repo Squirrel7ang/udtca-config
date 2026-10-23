@@ -9,7 +9,8 @@
 #   MODE=baseline GPUS=16 bash run_single_node.sh
 #   GPUS=16 -> PP=8 TP=1 DP=2；GPUS=8 -> PP=2 TP=2 DP=2，可用 PP_SIZE/TP_SIZE 覆盖。
 #   产物在 $CASE_DIR：train.log、logs/nccl.*.log、PRE_RUN.md、EXIT_CODE。
-#   数据集缓存和 dataset-config 都用 entry 的默认值，不在本脚本里写死。
+#   数据集缓存默认用 entry 的默认值（全量 fineweb），一个参数都不用带；
+#   DATASET_CONFIG / DATASET_FILES 只是可选的缩小范围开关。
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +23,15 @@ MAX_STEPS="${MAX_STEPS:-3}"
 MICRO_BATCHES="${MICRO_BATCHES:-16}"
 SEQ_LEN="${SEQ_LEN:-256}"
 MASTER_PORT="${MASTER_PORT:-29630}"
+# 数据集默认用 entry 的默认值（全量 fineweb），缩小范围时用 DATASET_CONFIG /
+# DATASET_FILES 覆盖。只给 DATASET_CONFIG 省不掉列目录（datasets 用的是卡片里
+# 第一个 config），挂死由 entry 的 httpx 读超时 + 重试兜底。
+DATASET_CONFIG="${DATASET_CONFIG:-}"
+DATASET_FILES="${DATASET_FILES:-}"
+
+DS_ARGS=(--dataset-name-or-path HuggingFaceFW/fineweb)
+[ -n "$DATASET_CONFIG" ] && DS_ARGS+=(--dataset-config "$DATASET_CONFIG")
+[ -n "$DATASET_FILES" ] && DS_ARGS+=(--data-files "$DATASET_FILES")
 
 case "$GPUS" in
   16) DEF_PP=8; DEF_TP=1 ;;
@@ -110,6 +120,7 @@ fi
   echo "- devices: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
   echo "- host: $(hostname)"
   echo "- steps=$MAX_STEPS micro_batches=$MICRO_BATCHES seq_len=$SEQ_LEN seed=${SEED:-1234}"
+  echo "- dataset=HuggingFaceFW/fineweb config=${DATASET_CONFIG:-<none>} files=${DATASET_FILES:-<none>}"
 } > "$CASE_DIR/PRE_RUN.md"
 
 if [ -f ~/.bashrc ]; then
@@ -173,6 +184,12 @@ export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-off}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-0}"
 export TORCH_NCCL_ENABLE_MONITORING="${TORCH_NCCL_ENABLE_MONITORING:-0}"
 export UDTCA_COMM_WATCHDOG_S="${UDTCA_COMM_WATCHDOG_S:-60}"
+# 解析数据集目录时 huggingface_hub 的 client 没有读超时，镜像断流会无限挂起；
+# entry 会给每个 httpx 请求补一个读超时并做有限次重试，这里是对应的上限。
+export UDTCA_HTTP_READ_TIMEOUT_S="${UDTCA_HTTP_READ_TIMEOUT_S:-30}"
+export UDTCA_DATASET_RETRIES="${UDTCA_DATASET_RETRIES:-3}"
+# 单次解析超过这个秒数没返回，就把所有线程栈打进日志（定位用，不中断训练）
+export UDTCA_DATASET_STALL_S="${UDTCA_DATASET_STALL_S:-120}"
 export UDTCA_REVOKE_QUIESCE_S="${UDTCA_REVOKE_QUIESCE_S:-10}"
 export UDTCA_REVOKE_BARRIER_S="${UDTCA_REVOKE_BARRIER_S:-5}"
 export UDTCA_REVOKE_FILE="${UDTCA_REVOKE_FILE:-}"
@@ -211,7 +228,7 @@ torchrun \
   --log-interval 1 \
   --seed "${SEED:-1234}" \
   --lr 2e-4 \
-  --dataset-name-or-path HuggingFaceFW/fineweb \
+  "${DS_ARGS[@]}" \
   --text-field text \
   --run-label "$RUN_LABEL" \
   "${METHOD_ARGS[@]}" \
