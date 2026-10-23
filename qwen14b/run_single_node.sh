@@ -182,6 +182,12 @@ export TORCH_SHOW_CPP_STACKTRACES=1
 # （如 COREX::is_valid_transpose_io_tensor_view）全打出来，量大且无从下手；
 # 排查时临时用 TORCH_CPP_LOG_LEVEL=INFO 覆盖即可。
 export TORCH_CPP_LOG_LEVEL="${TORCH_CPP_LOG_LEVEL:-WARNING}"
+# kineto 有自己的一套 logger，不受 TORCH_CPP_LOG_LEVEL 控制。CoreX 的 occupancy
+# 计算器只认 compute 3/5/6/7，TG 卡（8.1）上每个 kernel 都算失败报
+# "Failed to calculate occupancy, status = 2"（每 1000 次打一条）；profiler 本身
+# 正常，只是 trace 里少了 occupancy 指标，纯噪声。kineto 级别 ERROR=4，设 5 静音；
+# 要排查 kineto 自身的问题时设回 0/1。
+export KINETO_LOG_LEVEL="${KINETO_LOG_LEVEL:-5}"
 export TORCH_DISABLE_ADDR2LINE=1
 export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-off}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-0}"
