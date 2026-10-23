@@ -178,7 +178,10 @@ export CUDA_VISIBLE_DEVICES
 # 诊断日志 + 卡死自动回滚（revoke 后各 rank 自行退出）
 export PYTHONFAULTHANDLER=1
 export TORCH_SHOW_CPP_STACKTRACES=1
-export TORCH_CPP_LOG_LEVEL=INFO
+# C++ 侧日志默认 WARNING。开成 INFO 会把 CoreX kernel 内部的逐算子诊断
+# （如 COREX::is_valid_transpose_io_tensor_view）全打出来，量大且无从下手；
+# 排查时临时用 TORCH_CPP_LOG_LEVEL=INFO 覆盖即可。
+export TORCH_CPP_LOG_LEVEL="${TORCH_CPP_LOG_LEVEL:-WARNING}"
 export TORCH_DISABLE_ADDR2LINE=1
 export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-off}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-0}"
