@@ -17,6 +17,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${UDTCA_REPO_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 ENTRY="$REPO_ROOT/experiments/qwen14b/run_qwen14b_polar_dp_pp_tp.py"
 
+# 低比特 DP 同步严格串行（正确性优先，默认打开）。lowbit 的 phase1/phase2/
+# restore 共用同一个 comm，多个 bucket 同时在飞时两个 DP rank 的 p2p 投递
+# 顺序会分叉，偶发卡死；串行后一个 bucket 完全 restore 才发下一个。
+# 性能对照时用 POLAR_EF_LOWMEM_SERIAL_BUCKETS=0 关掉（2gbit 实测快约 12%）。
+export POLAR_EF_LOWMEM_SERIAL_BUCKETS="${POLAR_EF_LOWMEM_SERIAL_BUCKETS:-1}"
+
 MODE="${MODE:-baseline}"
 GPUS="${GPUS:-16}"
 MAX_STEPS="${MAX_STEPS:-3}"

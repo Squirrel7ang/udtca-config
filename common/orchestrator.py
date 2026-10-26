@@ -258,6 +258,12 @@ export CUDA_LAUNCH_BLOCKING="${{CUDA_LAUNCH_BLOCKING:-0}}"
 export NCCL_SOCKET_IFNAME
 export NCCL_IB_DISABLE
 
+# 低比特 DP 同步严格串行（正确性优先，默认打开）。lowbit 的 phase1/phase2/
+# restore 共用同一个 comm，多个 bucket 同时在飞时两个 DP rank 的 p2p 投递
+# 顺序会分叉，偶发卡死；串行后一个 bucket 完全 restore 才发下一个。
+# 性能对照时用 POLAR_EF_LOWMEM_SERIAL_BUCKETS=0 关掉（u13+u177 2gbit 实测快约 12%）。
+export POLAR_EF_LOWMEM_SERIAL_BUCKETS="${{POLAR_EF_LOWMEM_SERIAL_BUCKETS:-1}}"
+
 # ssh / conda 起的都是非交互非登录 shell，不会 source ~/.bashrc，HF 镜像要显式导出
 unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY NO_PROXY no_proxy
 export HF_ENDPOINT={hf_endpoint}

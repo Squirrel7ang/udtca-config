@@ -34,6 +34,11 @@ MODE=baseline bash run_single_node_8gpu.sh          # 8 卡 DP2×PP4×TP1
 - POLAR on：`--using-polar true --polar-hook ef_lowmem --comm-timing 8 --polar-bucket-numel 64000000 --polar-max-inflight-buckets 1`
 - POLAR off：`--using-polar false --polar-hook none --comm-timing 0`
 - 量化 on：`--method bitscom --bitwidth 2`；量化 off：`--method none`
+- 低比特 DP 同步默认**严格串行**：脚本里 `export POLAR_EF_LOWMEM_SERIAL_BUCKETS=1`
+  （可用同名环境变量覆盖成 0）。lowbit 的 phase1/phase2/restore 共用同一个 comm，
+  多个 bucket 同时在飞时两个 DP rank 的 p2p 投递顺序会分叉、偶发卡死；串行后一个
+  bucket 完全 restore 才发下一个。正确性优先，关掉大约快 12%（u13+u177 2gbit 实测）。
+  两机脚本（`run.py` / `generate_and_run.py` 生成的 0/1_train_*.sh）同样默认打开。
 - `baseline` 与 `bitscom` 走同一个 `_allreduce_dp_grads_`（逐参数 SUM 后除以 DP），只有后端不同。
 
 拓扑：`GPUS=16 -> PP8×TP1×DP2`，`GPUS=8 -> PP2×TP2×DP2`（8 卡 DP2×PP4×TP1 用
