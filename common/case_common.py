@@ -203,6 +203,12 @@ SETUP_CMDS = " && ".join(
         # 5) HF 镜像 + 清代理，不依赖任何代理工具（clash 等）
         f"export HF_ENDPOINT={HF_ENDPOINT}",
         "unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY NO_PROXY no_proxy",
+        # 6) 低比特 DP 同步严格串行，所有启动路径（POLAR 生成脚本 / 手写 baseline
+        #    脚本、node0 / node1）统一默认打开。lowbit 的 phase1/phase2/restore
+        #    共用同一个 comm，多个 bucket 同时在飞时两个 DP rank 的 p2p 投递顺序
+        #    会分叉、偶发卡死；串行后一个 bucket 完全 restore 才发下一个。
+        #    生成的 POLAR 脚本里也单独 export 了一次（手工直接跑脚本时同样生效）。
+        'export POLAR_EF_LOWMEM_SERIAL_BUCKETS="${POLAR_EF_LOWMEM_SERIAL_BUCKETS:-1}"',
     ]
 )
 
