@@ -66,7 +66,11 @@ def build_launch_params(config: Dict[str, Any], node_rank: int,
             ("run-label", "polar_bitscom_1f1b_tp"),
             ("polar-hook", "ef_lowmem"),
             ("polar-bucket-numel", 64000000),
-            ("polar-max-inflight-buckets", 4 if node_rank == 0 else 1),
+            # 两个 DP rank 的 bucket 调度规则必须完全一致：max_inflight 不同，
+            # 两侧 phase1/phase2/restore 的投递时机就会分叉，lowbit 的 p2p
+            # 对不上就直接卡死。这里不能按 node_rank 取不同值。
+            # 1 与 run_single_node.sh / SCRIPTS.md 的默认值一致。
+            ("polar-max-inflight-buckets", 1),
             ("method", "bitscom"),
             ("bitwidth", config["bit-width"]),
             # 每 10 步打一次 step/loss（polar-sgd 的 wrapper 读这个值）
