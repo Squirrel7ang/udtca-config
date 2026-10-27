@@ -137,7 +137,7 @@ if [ -f ~/.bashrc ]; then
 fi
 # /usr/local/corex 指向本机实际的 Corex 版本（4.4.0 / 4.5.0 都适用）
 export COREX_PATH="${UDTCA_COREX_PATH:-/usr/local/corex}"
-export COREX_TOOLKIT=/data/tianshu/20260720/corex/corex/corex-toolkit
+export COREX_TOOLKIT="${UDTCA_COREX_TOOLKIT:-/data/tianshu/20260720/corex/corex/corex-toolkit}"
 export CUDA_HOME="$COREX_PATH"
 export CPATH="$COREX_PATH/include:${CPATH:-}"
 export LIBRARY_PATH="$COREX_PATH/lib64:${LIBRARY_PATH:-}"
@@ -147,7 +147,10 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_SOCKET_RETRY_CNT="${NCCL_SOCKET_RETRY_CNT:-600}"
 export NCCL_SOCKET_RETRY_SLEEP_MSEC="${NCCL_SOCKET_RETRY_SLEEP_MSEC:-1000}"
 export PATH=/usr/local/corex/bin:/usr/local/corex/lib64/python3/dist-packages/bin:$PATH
-export LD_LIBRARY_PATH=$COREX_TOOLKIT/ixblas/lib64:$COREX_TOOLKIT/ixinfer/lib64:$COREX_PATH/lib64:/usr/local/corex/lib64:$COREX_TOOLKIT/ixdriver/lib64:$COREX_TOOLKIT/ixccl/lib64:/usr/mpi/gcc/openmpi-4.1.7rc1/lib
+# ixattention-backend 必须排在 $COREX_PATH/lib64 之前：/usr/local/corex 里那份
+# ixattnbkd_fwd/bwd/acc 是 ivcore11（BI 代）构建，本机 TG 卡是 ivcore30，
+# 会报 "invalid device function"；toolkit 这份才是 ivcore30。整套只能取同一目录。
+export LD_LIBRARY_PATH=$COREX_TOOLKIT/ixblas/lib64:$COREX_TOOLKIT/ixinfer/lib64:$COREX_TOOLKIT/ixattention-backend/lib64:$COREX_PATH/lib64:/usr/local/corex/lib64:$COREX_TOOLKIT/ixdriver/lib64:$COREX_TOOLKIT/ixccl/lib64:/usr/mpi/gcc/openmpi-4.1.7rc1/lib
 if [ -e "$COREX_TOOLKIT/ixccl/lib64/libnccl.so.2" ]; then
   export LD_PRELOAD="$COREX_TOOLKIT/ixccl/lib64/libnccl.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
@@ -158,10 +161,12 @@ if [ -z "$CONDA_ROOT" ]; then
     [ -d "$c" ] && { CONDA_ROOT="$c"; break; }
   done
 fi
-source "${CONDA_ROOT:?找不到 conda 根目录，请设置 UDTCA_CONDA_ROOT}/etc/profile.d/conda.sh"
-export PATH="$CONDA_ROOT/bin:$PATH"
-(conda deactivate >/dev/null 2>&1 || true)
-conda activate udtca
+if [ -z "${UDTCA_NO_CONDA:-}" ]; then
+  source "${CONDA_ROOT:?找不到 conda 根目录，请设置 UDTCA_CONDA_ROOT}/etc/profile.d/conda.sh"
+  export PATH="$CONDA_ROOT/bin:$PATH"
+  (conda deactivate >/dev/null 2>&1 || true)
+  conda activate udtca
+fi
 export PYTHONUNBUFFERED=1
 
 export NCCL_IB_DISABLE=1
