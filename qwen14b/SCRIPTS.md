@@ -5,6 +5,8 @@
 | 双机 / API（原有，勿改） | `run.py`、`generate_and_run.py`、`_run_baseline.py`、`metrics_api.py`、`start_metrics_api.py`、`API_USAGE.md`、`*.json` | 两机编排 |
 | 单机入口 | `cloud/run_single_node_8gpu.sh`、`edge/run_single_node_8gpu.sh` | 按机器选一个，内部转调 `run_docker_single_node.sh` |
 | 单机主体 | `run_docker_single_node.sh` | 容器内实际启动 torchrun 的脚本 |
+| 跨机连通性 | `cloud/run_nccl_xnode_cloud.sh`、`edge/run_nccl_xnode_edge.sh` + `nccl_xnode_test.py` | 两机各 1 卡，先测 NCCL 再测 bitscom |
+| 跨机训练 | `run_docker.py` | 在容器里拉起两机各 8 卡的端到端训练 |
 | 诊断 | `diag/` | 单机排障 |
 
 ## 1. 单机训练（容器内执行）
@@ -63,7 +65,42 @@ MODE=mixed bash cloud/run_single_node_8gpu.sh
 产物在 `$CASE_DIR`（默认 `run_log/single_qwen14b_<mode>_g<GPUS>_<时间戳>/`）：
 `train.log`、`logs/nccl.*.log`、`PRE_RUN.md`、`EXIT_CODE`。
 
-## 2. 诊断脚本（`diag/`）
+## 2. 跨机连通性（两机各 1 卡，world=2）
+
+两边各跑一个入口，先起哪边都行（rendezvous 会等对端）：
+
+```bash
+# powerone1（node0）
+bash cloud/run_nccl_xnode_cloud.sh --skip-lowbit  # 只测 NCCL，不 import bitscom
+# powerone2（node1）
+bash edge/run_nccl_xnode_edge.sh
+```
+
+`nccl_xnode_test.py` 的用例顺序：barrier → 阻塞 send/recv（环形）→ 异步
+isend/irecv（bf16 PP 激活形状）→ all_reduce → all_gather → all_to_all_single →
+bitscom 低比特 all_reduce（fp32 + bf16，跟 NCCL 全精度比相对误差）。
+全部通过会打 `=== ALL CHECKS PASSED ===`；失败打 `[FAIL] STEP n` 加栈。
+
+进程组自带 `--timeout-s`（默认 300s），超时由 c10d 自己抛异常。**不要 kill。**
+
+## 3. 跨机训练（`run_docker.py`）
+
+在能 ssh 到两台机器的机器上跑（不是容器里）：
+
+```bash
+cd udtca-config/qwen14b
+python run_docker.py --mode baseline                 # 2×8 卡，DP=4 PP=4 TP=1
+python run_docker.py --mode mixed --max-steps 3
+python run_docker.py --dry-run                       # 只打印两边命令
+```
+
+它做的事：远端建 case 目录 → ssh 起 node1（后台，日志落盘）→ 等 20s →
+ssh 起 node0（实时回显）→ 拉两边的 `train.log`/`EXIT_CODE` → 打汇总。
+启动仍走 `run_docker_single_node.sh`，本脚本只下发
+`NNODES=2 / NODE_RANK / MASTER_ADDR / CASE_DIR`。
+`--timeout-s` 只是停止等待，**不发信号**。
+
+## 4. 诊断脚本（`diag/`）
 
 | 脚本 | 机器 / 卡数 | 用途 |
 |---|---|---|
@@ -72,6 +109,6 @@ MODE=mixed bash cloud/run_single_node_8gpu.sh
 | `diag/diag_nccl_teardown.sh normal\|term` | 2 卡（`TEST_DEVICES`） | 危险：故意在 NCCL 在途时 SIGTERM，复现 XID 24 |
 | `diag/diag_lowbit_teardown.py` | 2 rank | lowbit PG all-reduce 正确性 + 干净 teardown |
 
-## 3. 双机
+## 5. 双机（旧路径）
 
-双机走 `python run.py ...`（见 `API_USAGE.md`）。
+宿主机 conda 那套 `python run.py ...` 仍保留（见 `API_USAGE.md`）。

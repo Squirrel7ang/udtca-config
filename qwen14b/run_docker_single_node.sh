@@ -33,6 +33,10 @@ MICRO_BATCHES="${MICRO_BATCHES:-16}"
 SEQ_LEN="${SEQ_LEN:-256}"
 MASTER_PORT="${MASTER_PORT:-29630}"
 DATASET_CONFIG="${DATASET_CONFIG:-sample-10BT}"
+# 跨机时由 run_docker.py 下发；不设就是单机（默认值和单机完全一致）。
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 
 DP_SIZE=$((GPUS / (PP_SIZE * TP_SIZE)))
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$(seq -s, 0 $((GPUS - 1)))}"
@@ -82,6 +86,7 @@ TEE=(tee -a "$CASE_DIR/train.log" "$RUN_LOG")
   echo "# PRE_RUN $TS"
   echo "- runner: run_docker_single_node.sh (container corex 4.5.0)"
   echo "- topology: GPUs=$GPUS DP=$DP_SIZE PP=$PP_SIZE TP=$TP_SIZE MODE=$MODE"
+  echo "- distributed: nnodes=$NNODES node_rank=$NODE_RANK master=$MASTER_ADDR:$MASTER_PORT"
   echo "- mode_args: ${METHOD_ARGS[*]}"
   echo "- devices: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
   echo "- host: $(hostname)"
@@ -176,9 +181,9 @@ find "$REPO_ROOT/experiments/qwen14b/cache" -maxdepth 1 \
 cd "$REPO_ROOT"
 torchrun \
   --nproc_per_node="$GPUS" \
-  --nnodes=1 \
-  --node_rank=0 \
-  --master_addr=127.0.0.1 \
+  --nnodes="$NNODES" \
+  --node_rank="$NODE_RANK" \
+  --master_addr="$MASTER_ADDR" \
   --master_port="$MASTER_PORT" \
   "$ENTRY" \
   --model-name Qwen/Qwen2.5-14B-Instruct \
