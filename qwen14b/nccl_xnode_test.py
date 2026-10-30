@@ -15,9 +15,9 @@
 rendezvous 会等对端）：
 
     # powerone1（node0）
-    bash cloud/run_nccl_xnode_cloud.sh
+    bash cloud/run_nccl_xnode.sh
     # powerone2（node1）
-    bash edge/run_nccl_xnode_edge.sh
+    bash edge/run_nccl_xnode.sh
 
 **不要用 timeout / SIGTERM / kill 停它**：Corex 4.5.0 下打断在途 NCCL 会触发
 XID 24 MMU page fault，卡永久挂死只能重启。进程组带着 timeout，任何集合通信

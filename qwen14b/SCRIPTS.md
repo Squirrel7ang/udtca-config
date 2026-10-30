@@ -5,8 +5,9 @@
 | 双机 / API（原有，勿改） | `run.py`、`generate_and_run.py`、`_run_baseline.py`、`metrics_api.py`、`start_metrics_api.py`、`API_USAGE.md`、`*.json` | 两机编排 |
 | 单机入口 | `cloud/run_single_node_8gpu.sh`、`edge/run_single_node_8gpu.sh` | 按机器选一个，内部转调 `run_docker_single_node.sh` |
 | 单机主体 | `run_docker_single_node.sh` | 容器内实际启动 torchrun 的脚本 |
-| 跨机连通性 | `cloud/run_nccl_xnode_cloud.sh`、`edge/run_nccl_xnode_edge.sh` + `nccl_xnode_test.py` | 两机各 1 卡，先测 NCCL 再测 bitscom |
-| 跨机训练 | `run_docker.py` | 在容器里拉起两机各 8 卡的端到端训练 |
+| 跨机连通性 | `cloud/run_nccl_xnode.sh`、`edge/run_nccl_xnode.sh` + `nccl_xnode_test.py` | 两机各 1 卡，先测 NCCL 再测 bitscom |
+| 跨机训练（手动） | `cloud/run_xnode.sh`、`edge/run_xnode.sh` | 两台各 16 卡、PP=8 TP=2；各自容器内执行，见 `XNODE-USAGE.md` |
+| 跨机训练（一键） | `run_docker.py` | 在 powerone1 **宿主机**执行，自动起两机容器跑 mixed/baseline 并分析 trace |
 | 诊断 | `diag/` | 单机排障 |
 
 ## 1. 单机训练（容器内执行）
@@ -27,7 +28,7 @@ MODE=baseline bash edge/run_single_node_8gpu.sh     # 边侧 powerone2
 | `NCCL_SOCKET_IFNAME` | `ens120f0` | `enx00e04c680003` |
 | `UDTCA_NODE0_IP` | `10.205.200.14` | `10.205.200.14` |
 | `UDTCA_NODE1_HOST` | `10.205.200.16` | `10.205.200.16` |
-| `NCCL_P2P_DISABLE` | `1` | `1` |
+| `NCCL_P2P_DISABLE` | `0` | `0` |
 
 `NCCL_P2P_DISABLE=1` 是因为两台机器的 P2P 直连都不稳，统一走间接中继。
 
@@ -71,9 +72,9 @@ MODE=mixed bash cloud/run_single_node_8gpu.sh
 
 ```bash
 # powerone1（node0）
-bash cloud/run_nccl_xnode_cloud.sh --skip-lowbit  # 只测 NCCL，不 import bitscom
+bash cloud/run_nccl_xnode.sh --skip-lowbit  # 只测 NCCL，不 import bitscom
 # powerone2（node1）
-bash edge/run_nccl_xnode_edge.sh
+bash edge/run_nccl_xnode.sh
 ```
 
 `nccl_xnode_test.py` 的用例顺序：barrier → 阻塞 send/recv（环形）→ 异步

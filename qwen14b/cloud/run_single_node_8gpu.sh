@@ -10,8 +10,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export GPUS=8
-export PP_SIZE=4
-export TP_SIZE=1
+export PP_SIZE="${PP_SIZE:-4}"
+export TP_SIZE="${TP_SIZE:-1}"
 export SKIP_PRECHECK=1
 # 这台机器的 P2P 直连不稳，统一走间接中继；要对照直连时显式设成 0。
 export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
