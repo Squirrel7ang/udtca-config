@@ -95,11 +95,30 @@ python run_docker.py --mode mixed --max-steps 3
 python run_docker.py --dry-run                       # 只打印两边命令
 ```
 
-它做的事：远端建 case 目录 → ssh 起 node1（后台，日志落盘）→ 等 20s →
+它做的事：**卡检查** → 远端建 case 目录 → ssh 起 node1（后台，日志落盘）→ 等 20s →
 ssh 起 node0（实时回显）→ 拉两边的 `train.log`/`EXIT_CODE` → 打汇总。
+
+卡检查在**每个 mode 起训前**都做一遍，任一台不干净就整轮不启动（`--skip-card-check` 可跳过）：
+
+- **占用**：两台节点容器里 `ixsmi --query-gpu=index,memory.used` 超阈值（默认 256 MiB）
+  或有 `--query-compute-apps`，打印占卡进程后退出，不启动训练；
+- **健康**：仿 `~/check.sh`，宿主机 `journalctl -k -b | grep -E 'page fault|vmid'`
+  有输出就认为卡有问题（Corex XID 24 MMU 挂死就是这么报的），不启动训练。
 启动仍走 `run_docker_single_node.sh`，本脚本只下发
 `NNODES=2 / NODE_RANK / MASTER_ADDR / CASE_DIR`。
 `--timeout-s` 只是停止等待，**不发信号**。
+
+分析数据有三个来源，和 `run.py` / `metrics_api.py` 同一套口径：
+
+| 来源 | 内容 | 什么时候有 |
+|---|---|---|
+| profiler trace | 每步耗时、GPU busy、DP/PP 标注、DP∩PP 重叠估计、kernel 分类、通信 vs 计算 | 两个 mode 都跑完后 |
+| `[rt-metric]`（train.log，每步一行） | DP-PP 重叠率、pp_ms/dp_ms、通信 dense/compressed/saved、压缩比 | 训练**每跑一步就有**，终端 20s 打一次摘要，最终按步列表 + 均值 |
+| `logs/nccl*.log`（`NCCL_DEBUG_SUBSYS=COLL`） | 端到端集合通信 payload 字节（两节点合计、按算子） | 每个 mode 跑完 |
+
+产物：`<run>/summary.md`、`summary.json`、`analysis.log`（trace 分析）、
+`metrics.log`（实时指标 + 通信量），终端同时打印；baseline vs mixed 的对比包含
+步时/吞吐、端到端通信量与降低倍数、重叠率、压缩比。
 
 ## 4. 诊断脚本（`diag/`）
 

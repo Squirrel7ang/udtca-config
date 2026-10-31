@@ -5,14 +5,26 @@
   * node0 = 本机，宿主机执行 `docker exec trj-udtca ...`
   * node1 = powerone2，宿主机执行 `ssh <node1> 'docker exec trj-udtca ...'`
 
-每个 mode（默认 mixed 先、baseline 后）依次做一遍：
+每个 mode（默认 mixed 先、baseline 后）跑之前先过一道卡检查（见 card_precheck）：
+  * 占用：两台节点容器里 `ixsmi --query-gpu/--query-compute-apps`，有人在用就不启动
+  * 健康：宿主机 `journalctl -k -b` 里出现 page fault / vmid（Corex XID 24）就不启动
+  任一台不干净，本轮（含后续 mode）直接跳过，不启动训练。
+
+每个 mode 依次做一遍：
 
   1. 在 run 目录下给两台机器各生成一份训练脚本
      `<run>/scripts/node{0,1}_<mode>.sh`（自包含：环境、METHOD_ARGS、torchrun 全在里面）
   2. 先起 node1（后台，输出落 node1.ssh.log），warmup 后起 node0（实时回显 + 落盘）
-  3. 等两边退出，收集 train.log / step_csv / profiler trace
-  4. 全部跑完自动做 trace 分析（每步耗时、通信/计算占比、DP/PP 标注），
-     结果同时打到终端和 `<run>/analysis.log`、`<run>/summary.md`
+  3. 等两边退出，收集 train.log / step_csv / profiler trace / [rt-metric] / NCCL 日志
+  4. 全部跑完自动分析：
+     * trace 口径：每步耗时、GPU busy、DP/PP 标注、DP∩PP 重叠估计、kernel 分类、
+       通信 vs 计算；
+     * 实时口径：每步 `[rt-metric]` 的 DP-PP 重叠率、pp_ms/dp_ms、通信
+       dense/compressed/saved、压缩比（只有开 polar 的 mode 有）；
+     * 通信量：`logs/nccl_*.log` 里 NCCL 自报的集合通信 payload 字节，两节点合计
+       （口径同 udtca-config/utils/parse_nccl_bytes.py）。
+     结果同时打到终端和 `<run>/analysis.log`、`<run>/metrics.log`、`<run>/summary.md`。
+     baseline vs mixed 的对比里包含步时/吞吐、端到端通信量与降低倍数、重叠率、压缩比。
 
 profiler：每个 mode 跑 10 iter，只录第 8、9 iter
 （`--profiler-wait-steps 7 --profiler-warmup-steps 0 --profiler-active-steps 2`）。
@@ -24,10 +36,12 @@ profiler：每个 mode 跑 10 iter，只录第 8、9 iter
 
 用法：
     python3 run_docker.py                      # mixed 先跑、再 baseline，各 10 iter
+    python3 run_docker.py --only-baseline      # 只跑 baseline，不跑 mixed
     python3 run_docker.py --modes mixed        # 只跑 mixed
     python3 run_docker.py --max-steps 3        # 冒烟（此时 profile 不到 8/9 iter）
     python3 run_docker.py --dry-run            # 只打印生成的脚本，什么都不启动
-    python3 run_docker.py --preflight-only     # 只检查两台机器/容器/ssh 是否就绪
+    python3 run_docker.py --preflight-only     # 只检查两台机器/容器/ssh/卡占用/卡健康
+    python3 run_docker.py --skip-card-check    # 卡检查有历史日志噪音时临时跳过
 """
 
 import argparse
@@ -290,6 +304,47 @@ def pump(proc):
     proc.wait()
 
 
+def _tail_rt_lines(host, container, log_path, n=3):
+    """取日志里最后 n 条 [rt-metric]（tail 只读文件尾，不会把整份日志拖过来）。"""
+    inner = (f"grep '\\[rt-metric\\]' {shlex.quote(str(log_path))} 2>/dev/null | tail -n {n}")
+    try:
+        out = subprocess.run(_docker(host, container, inner), capture_output=True,
+                             text=True, timeout=30)
+    except Exception:                                          # noqa: BLE001
+        return []
+    return [ln for ln in out.stdout.splitlines() if "[rt-metric]" in ln]
+
+
+def live_metrics_loop(mode, container, node_dirs, stop_event, poll_s=20.0):
+    """训练进行中，每隔 poll_s 把两台新出的 [rt-metric] 摘要打到终端。
+
+    数据本来每步就落进 train.log（print flush + tee），这里只是把它压缩成一行打出来，
+    让「跑到第几步、重叠率多少、压缩多少」在训练当中就能看到，而不用等整轮跑完。
+    """
+    last_step = {0: 0, 1: 0}
+    while not stop_event.wait(poll_s):
+        for rank in (0, 1):
+            lines = _tail_rt_lines(NODES[rank]["host"], container,
+                                   Path(node_dirs[rank]) / "train.log", n=5)
+            for line in lines:
+                kv = dict(_KV_RE.findall(line.split("[rt-metric]", 1)[1]))
+                try:
+                    step = int(kv.get("step", "0"))
+                except ValueError:
+                    continue
+                if step <= last_step[rank]:          # 已经打过的步
+                    continue
+                last_step[rank] = step
+                bits = [f"step={step}", f"loss={kv.get('loss', '?')}"]
+                if kv.get("dp_pp_overlap"):
+                    bits.append(f"DP∩PP={kv['dp_pp_overlap']}")
+                if kv.get("comm_reduction"):
+                    bits.append(f"压缩={kv['comm_reduction']}"
+                                f" (dense {kv.get('comm_dense', '?')} → "
+                                f"{kv.get('comm_compressed', '?')})")
+                print(f"  [metric] {mode} node{rank} " + "  ".join(bits), flush=True)
+
+
 def wait_proc(proc, timeout_s, label):
     try:
         return proc.wait(timeout=timeout_s), False
@@ -370,9 +425,10 @@ def preflight(args):
               _docker(node["host"], args.container,
                       f"touch {args.repo}/run_log/.preflight && rm -f "
                       f"{args.repo}/run_log/.preflight && echo ok"))
-        check(f"node{rank} 容器里能看到 8 张卡",
+        check(f"node{rank} 容器里能看到 {args.gpus} 张卡",
               _docker(node["host"], args.container,
-                      "test $(ls /dev/ix* 2>/dev/null | wc -l) -ge 8 && echo ok || echo cards"),
+                      f"test $(ls /dev/ix* 2>/dev/null | wc -l) -ge {args.gpus} "
+                      f"&& echo ok || echo cards"),
               essential=False)
 
     if problems:
@@ -389,6 +445,156 @@ def preflight(args):
 
 
 # ---------------------------------------------------------------- 中断清理
+
+# ---------------------------------------------------------------- 卡占用 / 卡健康检查
+#
+# 两道闸，都在启动训练之前：
+#   1) 占用：两台节点各自的容器里跑 ixsmi，有显存超阈值或 --query-compute-apps
+#      非空，就认为卡被占着（别人在用、或者上一轮没退干净），本次不启动训练。
+#      对齐 udtca-config/common/case_common.py 的 check_gpus_free()。
+#   2) 健康：仿照 powerone1:~/check.sh，宿主机本 boot 的内核日志里只要有
+#      "page fault" 或 "vmid" 就认为卡不干净（Corex 的 XID 24 MMU 挂死就是这么报的）。
+
+# 空载时每张卡约 68 MiB（驱动本身），超过阈值就认为有人在用
+GPU_MEM_THRESHOLD_MIB = 256
+
+GPU_OCCUPANCY_SNIPPET = r"""
+THRESHOLD=__THRESHOLD__
+export LD_LIBRARY_PATH=/usr/local/corex/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+
+SMI=""
+for c in ixsmi /usr/local/bin/ixsmi /usr/local/corex/bin/ixsmi \
+         /data/tangruijing/udtca/.corex-4.5.0/bin/ixsmi /usr/local/corex-4.5.0/bin/ixsmi nvidia-smi; do
+  if command -v "$c" >/dev/null 2>&1; then SMI="$c"; break; fi
+done
+if [ -z "$SMI" ]; then
+  echo "NO_SMI"
+  exit 2
+fi
+
+BUSY=$("$SMI" --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
+  | awk -F, -v t="$THRESHOLD" '{
+      gsub(/[ \t]/,"",$1); gsub(/[ \t]/,"",$2);
+      if ($1 != "" && $2+0 > t) printf "GPU%s(%sMiB) ", $1, $2 }')
+APPS=$("$SMI" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null \
+  | sed '/^[[:space:]]*$/d')
+
+if [ -n "$BUSY" ] || [ -n "$APPS" ]; then
+  echo "BUSY $SMI"
+  [ -n "$BUSY" ] && echo "  超过 ${THRESHOLD}MiB 的卡: $BUSY"
+  [ -n "$APPS" ] && { echo "  正在跑的进程:"; echo "$APPS" | cut -c1-200 | sed 's/^/    /'; }
+  exit 1
+fi
+
+echo "FREE $SMI"
+exit 0
+"""
+
+# 只在宿主机上跑（容器里读不到 journald）；读不到内核日志时返回 2，不阻塞
+HEALTH_SNIPPET = r"""
+N=$(journalctl -k -b 2>/dev/null | wc -l)
+if [ "$N" -lt 50 ]; then
+  echo "NO_JOURNALD"
+  exit 2
+fi
+FAULTS=$(journalctl -k -b 2>/dev/null | grep -i "page fault")
+VMIDS=$(journalctl -k -b 2>/dev/null | grep -i "vmid")
+if [ -n "$FAULTS$VMIDS" ]; then
+  echo "DIRTY"
+  [ -n "$FAULTS" ] && { echo "  page fault:"; echo "$FAULTS" | cut -c1-220 | tail -10 | sed 's/^/    /'; }
+  [ -n "$VMIDS" ] && { echo "  vmid:"; echo "$VMIDS" | cut -c1-220 | tail -10 | sed 's/^/    /'; }
+  exit 1
+fi
+echo "CLEAN"
+exit 0
+"""
+
+
+def _run_capture(argv, timeout=90):
+    """跑一条命令，返回 (returncode | None, 输出文本)。异常只当作失败，不抛。"""
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except Exception as exc:                                   # noqa: BLE001
+        return None, f"{exc.__class__.__name__}: {exc}"
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def _print_block(text, indent="      "):
+    for line in text.splitlines():
+        print(indent + line)
+
+
+def check_card_occupancy(args, node):
+    """在一台节点的容器里看卡有没有被占用。返回 'free' / 'busy' / 'unknown'。"""
+    snippet = GPU_OCCUPANCY_SNIPPET.replace("__THRESHOLD__", str(args.gpu_mem_threshold))
+    rc, out = _run_capture(_docker(node["host"], args.container, snippet))
+    if rc == 0:
+        print(f"    [OK  ] 空闲（{out.splitlines()[0] if out else 'FREE'}）")
+        return "free"
+    if rc == 1:
+        lines = out.splitlines()
+        print(f"    [占用] {lines[0] if lines else 'BUSY'}")
+        _print_block("\n".join(lines[1:]))
+        return "busy"
+    if rc == 2:
+        print(f"    [警告] 没找到 ixsmi，跳过占用检查（{out}）")
+        return "unknown"
+    print(f"    [警告] 占用检查执行失败（rc={rc}）：{out}")
+    return "unknown"
+
+
+def check_card_health(node):
+    """在宿主机上看本 boot 内核日志有没有 page fault / vmid。返回 'clean'/'dirty'/'unknown'。"""
+    rc, out = _run_capture(_on(node["host"], HEALTH_SNIPPET))
+    if rc == 0:
+        print("    [OK  ] 内核日志无 page fault / vmid")
+        return "clean"
+    if rc == 1:
+        lines = out.splitlines()
+        print(f"    [异常] {lines[0] if lines else 'DIRTY'}")
+        _print_block("\n".join(lines[1:]))
+        return "dirty"
+    if rc == 2:
+        print("    [警告] 读不到内核日志（需要 systemd-journald 读权限），跳过健康检查")
+        return "unknown"
+    print(f"    [警告] 健康检查执行失败（rc={rc}）：{out}")
+    return "unknown"
+
+
+def card_precheck(args, when=""):
+    """启动训练前的两道闸：卡有没有被占用 + 卡有没有报错。
+
+    任一台节点「被子占用」或「内核日志里有 page fault / vmid」就返回 False，
+    调用方不要再启动训练。
+    """
+    title = "启动前检查：卡占用 / 卡健康" + (f"（{when}）" if when else "")
+    print("\n" + "-" * 78)
+    print(title)
+    print("-" * 78)
+    problems = []
+    for rank in (0, 1):
+        node = NODES[rank]
+        print(f"  node{rank} {node['name']}:")
+        occ = check_card_occupancy(args, node)
+        health = check_card_health(node)
+        if occ == "busy":
+            problems.append(f"node{rank} {node['name']} 的卡正被占用")
+        if health == "dirty":
+            problems.append(f"node{rank} {node['name']} 内核日志里有 page fault / vmid")
+    if problems:
+        print("\n[卡不可用] 以下问题没解决，本次不启动训练：")
+        for p in problems:
+            print(f"  - {p}")
+        print("\n处理建议：")
+        print("  · 被占用：等占用进程结束再重跑；若是上一轮遗留的训练，先确认它真的停了")
+        print("    （ps -ef | grep run_qwen14b_polar_dp_pp_tp），不要在 NCCL 在途时强杀。")
+        print("  · page fault / vmid：Corex 上通常是 XID 24 MMU 挂死，只能重启机器恢复；")
+        print("    先看 ixsmi 与 journalctl -k -b | grep -E 'page fault|vmid' 确认是哪张卡。")
+        print("  · 确认无误、只是历史日志噪音时，可用 --skip-card-check 跳过这两道闸。")
+        return False
+    print("  卡检查通过。")
+    return True
+
 
 _STATE = {"args": None, "active": False, "proc0": None, "proc1": None, "cleaned": False}
 
@@ -441,6 +647,168 @@ def _losses_from_text(text):
         if m:
             rows.append((int(m.group(1)), float(m.group(2))))
     return rows
+
+
+# ---------------------------------------------------------------- 实时指标（[rt-metric]）
+#
+# polar-sgd 的 wrapper._emit_rt_metric 每步打一行（不受 --log-interval 限制），
+# 是 DP/PP 重叠率和通信压缩量的**在线**口径，和 run.py / metrics_api.py 同一个源：
+#
+#   [rt-metric] step=3 loss=11.7841 pp_ms=1234.50 dp_ms=321.00 dp_pp_overlap=21.3%
+#               comm_dense=2.4303GB comm_compressed=313.2745MB
+#               comm_saved=2.1170GB comm_reduction=7.76x
+#
+# 只有开了 polar 的 mode（polar_dense / mixed）才有这行；baseline / bitscom 没有，
+# 这时不能当成 0，要如实报「未测到」。
+
+_RT_RE = re.compile(r"\[rt-metric\]\s+(.*)")
+_KV_RE = re.compile(r"(\w+)=([^\s]+)")
+_BYTE_UNITS = {"GB": 1e9, "MB": 1e6, "KB": 1e3, "B": 1.0}
+
+
+def _parse_bytes(text):
+    for unit, mul in _BYTE_UNITS.items():
+        if text.endswith(unit):
+            try:
+                return float(text[: -len(unit)]) * mul
+            except ValueError:
+                return None
+    return None
+
+
+def parse_rt_metrics(text):
+    """从 train.log 里抽出每一步的 [rt-metric] 记录（原样 kv，后面再换算）。"""
+    rows = []
+    for line in text.splitlines():
+        m = _RT_RE.search(line)
+        if not m:
+            continue
+        rec = dict(_KV_RE.findall(m.group(1)))
+        rows.append(rec)
+    return rows
+
+
+def _rt_summary(rt):
+    """把每步的 [rt-metric] 归并成均值/极值；没有该行就返回 None（不是 0）。"""
+    if not rt:
+        return None
+
+    def vals(key, strip_pct=False):
+        out = []
+        for r in rt:
+            v = r.get(key)
+            if v is None:
+                continue
+            try:
+                out.append(float(v.rstrip("%") if strip_pct else v.rstrip("x")))
+            except ValueError:
+                pass
+        return out
+
+    ov = vals("dp_pp_overlap", strip_pct=True)
+    dense = [_parse_bytes(r["comm_dense"]) for r in rt if r.get("comm_dense")]
+    comp = [_parse_bytes(r["comm_compressed"]) for r in rt if r.get("comm_compressed")]
+    saved = [_parse_bytes(r["comm_saved"]) for r in rt if r.get("comm_saved")]
+    dense = [v for v in dense if v is not None]
+    comp = [v for v in comp if v is not None]
+    saved = [v for v in saved if v is not None]
+    mean = lambda xs: (sum(xs) / len(xs)) if xs else None  # noqa: E731
+    return {
+        "rt_steps": len(rt),
+        "rt_overlap_mean": mean(ov) / 100.0 if ov else None,   # 0..1
+        "rt_pp_ms_mean": mean(vals("pp_ms")),
+        "rt_dp_ms_mean": mean(vals("dp_ms")),
+        "rt_comm_dense_gb": (mean(dense) / 1e9) if dense else None,
+        "rt_comm_compressed_gb": (mean(comp) / 1e9) if comp else None,
+        "rt_comm_saved_gb": (mean(saved) / 1e9) if saved else None,
+        "rt_comm_reduction_mean": mean(vals("comm_reduction")),
+        "rt_steps_detail": [
+            {
+                "step": r.get("step"),
+                "loss": r.get("loss"),
+                "pp_ms": r.get("pp_ms"),
+                "dp_ms": r.get("dp_ms"),
+                "overlap": r.get("dp_pp_overlap"),
+                "comm_dense": r.get("comm_dense"),
+                "comm_compressed": r.get("comm_compressed"),
+                "comm_saved": r.get("comm_saved"),
+                "comm_reduction": r.get("comm_reduction"),
+            }
+            for r in rt
+        ],
+    }
+
+
+# ---------------------------------------------------------------- NCCL 集合通信字节
+#
+# 口径与 udtca-config/utils/parse_nccl_bytes.py 一致：NCCL_DEBUG_SUBSYS=COLL 的每行
+# 都带 count 和 datatype，乘起来就是「交给网络的那块 buffer」的字节数。把该 case
+# 所有 rank 加起来 = 这一跑端到端真正通信的量（压缩过的 DP + 未压缩的 TP/PP 都在内）。
+# 比读网卡计数器干净：k8s 节点上还有别的租户流量。
+#
+# 日志在容器里，脚本也在容器里跑，只把聚合结果带回来。
+
+NCCL_COLL_CODE = r'''
+import glob, json, re, sys
+from collections import defaultdict
+
+COLL_RE = re.compile(r"NCCL INFO (AllReduce|AllGather|ReduceScatter|AllToAll|"
+                     r"Broadcast|Send|Recv|Reduce|Gather|Scatter)\b")
+COUNT_RE = re.compile(r"\bcount (\d+)")
+DTYPE_RE = re.compile(r"\bdatatype (\d+)")
+DTYPE_BYTES = {0: 1, 1: 1, 2: 4, 3: 4, 4: 8, 5: 8, 6: 2, 7: 4, 8: 8, 9: 2}
+
+paths = sorted(glob.glob(sys.argv[1] + "/logs/nccl*.log"))
+total = 0
+by_op = defaultdict(int)
+unknown = 0
+for path in paths:
+    with open(path, errors="ignore") as fh:
+        for line in fh:
+            if "NCCL INFO" not in line:
+                continue
+            m = COLL_RE.search(line)
+            if not m:
+                continue
+            mc = COUNT_RE.search(line)
+            if not mc:
+                continue
+            count = int(mc.group(1))
+            md = DTYPE_RE.search(line)
+            size = DTYPE_BYTES.get(int(md.group(1)) if md else -1)
+            if size is None:
+                unknown += count
+                continue
+            nbytes = count * size
+            total += nbytes
+            by_op[m.group(1)] += nbytes
+
+print(json.dumps({
+    "logs": len(paths),
+    "total_bytes": total,
+    "unknown_elements": unknown,
+    "by_op_gb": {k: round(v / 1e9, 6) for k, v in sorted(by_op.items(), key=lambda x: -x[1])},
+}))
+'''
+
+
+def parse_nccl_bytes(host, container, case_dir):
+    """在容器里扫 logs/nccl*.log，返回端到端集合通信字节量。扫不到就返回 logs=0。"""
+    argv = _on(host, f"docker exec -i {container} python3 - {shlex.quote(str(case_dir))}")
+    try:
+        proc = subprocess.run(argv, input=NCCL_COLL_CODE, capture_output=True,
+                              text=True, timeout=600)
+    except Exception as exc:                                   # noqa: BLE001
+        return {"error": f"{exc.__class__.__name__}: {exc}"}
+    out = (proc.stdout or "").strip().splitlines()
+    for line in reversed(out):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                break
+    return {"error": (proc.stderr or "no output").strip().splitlines()[-1:] or "no output"}
 
 
 def parse_step_csv(host, container, case_dir):
@@ -670,6 +1038,13 @@ def analysis_report(rows, args):
             compute = sum(cats.get(k, 0.0) for k in ("gemm", "elementwise", "reduce", "attn"))
             add(f"    通信 vs 计算  comm={comm:.2f}s ({100 * comm / agg['window_s']:.1f}%)  "
                 f"compute={compute:.2f}s ({100 * compute / agg['window_s']:.1f}%)")
+            # 重叠率按 utils/overlap_interval.py 的口径：|DP∩PP| / (|DP|+|PP|-|DP∩PP|)。
+            # 这里只有标注区间的累计秒数，交集用 dp+pp-window 估计（假设并集是整步）。
+            ovl = max(0.0, agg["dp_s"] + agg["pp_s"] - agg["window_s"])
+            denom = agg["dp_s"] + agg["pp_s"] - ovl
+            if denom > 0:
+                add(f"    DP∩PP 重叠    {ovl:8.2f} s  ({100 * ovl / denom:5.1f}%)   "
+                    f"← 标注区间估计")
         if r.get("avg_step_s"):
             add(f"  step_csv（最后一级 stage）: {r['num_steps']} 步, "
                 f"均值 {r['avg_step_s']:.2f} s, 逐步 "
@@ -677,6 +1052,73 @@ def analysis_report(rows, args):
         if agg_all:
             best = min(a["window_s"] for a in agg_all)
             add(f"  → 本 mode 稳态步时长 {best:.2f} s（两节点取快的一侧）")
+    add("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 实时指标报告
+
+def _fmt_gb(v, nd=3):
+    return f"{v:.{nd}f}" if v is not None else "-"
+
+
+def _fmt_pct(v, nd=1):
+    return f"{100 * v:.{nd}f}%" if v is not None else "-"
+
+
+def metrics_report(rows, args):
+    """每步实时指标（[rt-metric]）+ 端到端 NCCL 通信量，返回可直接打印/落盘的文本。"""
+    lines = []
+    add = lines.append
+    add("=" * 78)
+    add("实时指标（[rt-metric] 每步一条）与端到端集合通信量")
+    add("=" * 78)
+    add("  [rt-metric] 来自 polar wrapper（polar-sgd/src/psgd/parallelism/polar/wrapper.py），")
+    add("  和 run.py / metrics_api.py 同源；只有开了 polar 的 mode（polar_dense/mixed）才有。")
+
+    for r in rows:
+        add(f"\n## {r['mode']}   EXIT_CODE node0={r['exit0']} node1={r['exit1']}")
+        for rank in (0, 1):
+            rt = r["rt"][rank]
+            name = NODES[rank]["name"]
+            if not rt:
+                add(f"  node{rank} {name}: 没有 [rt-metric]"
+                    + ("（baseline/bitscom 不开 polar，DP 重叠率与压缩量无从谈起）"
+                       if r["mode"] in ("baseline", "bitscom") else "（训练没进到打印指标那一步）"))
+                continue
+            add(f"  node{rank} {name}: {rt['rt_steps']} 步有指标")
+            for d in rt["rt_steps_detail"]:
+                add(f"    step={str(d['step']):>3}  loss={str(d['loss']):>8}  "
+                    f"pp_ms={str(d['pp_ms']):>9}  dp_ms={str(d['dp_ms']):>8}  "
+                    f"DP∩PP={str(d['overlap']):>7}  "
+                    f"dense={str(d['comm_dense']):>9}  comp={str(d['comm_compressed']):>9}  "
+                    f"saved={str(d['comm_saved']):>9}  压缩={str(d['comm_reduction']):>7}")
+            add(f"    均值: DP-PP 重叠={_fmt_pct(rt['rt_overlap_mean'])}  "
+                f"pp={_fmt(rt['rt_pp_ms_mean'], 1)}ms  dp={_fmt(rt['rt_dp_ms_mean'], 1)}ms  "
+                f"每步通信 dense={_fmt_gb(rt['rt_comm_dense_gb'])}GB "
+                f"compressed={_fmt_gb(rt['rt_comm_compressed_gb'])}GB "
+                f"saved={_fmt_gb(rt['rt_comm_saved_gb'])}GB "
+                f"压缩比={_fmt(rt['rt_comm_reduction_mean'], 2)}x")
+
+        nc0, nc1 = r["nccl"][0], r["nccl"][1]
+        total = r.get("nccl_total_bytes")
+        if total is None:
+            why = (nc0.get("error") or nc1.get("error")
+                   or "没有 logs/nccl*.log（NCCL_DEBUG_SUBSYS=COLL 未生效或训练没起来）")
+            add(f"  端到端集合通信量: 未测得（{why}）")
+        else:
+            add(f"  端到端集合通信量（NCCL COLL payload，两节点合计）: "
+                f"{_fmt_gb(total / 1e9)} GB  "
+                f"(node0 {_fmt_gb(nc0['total_bytes'] / 1e9)} GB / "
+                f"node1 {_fmt_gb(nc1['total_bytes'] / 1e9)} GB, "
+                f"{nc0.get('logs', 0) + nc1.get('logs', 0)} 个 rank 日志)")
+            ops = {}
+            for nc in (nc0, nc1):
+                for op, gb in (nc.get("by_op_gb") or {}).items():
+                    ops[op] = ops.get(op, 0.0) + gb
+            if ops:
+                add("    按算子: " + "  ".join(f"{k}={v:.3f}GB"
+                                             for k, v in sorted(ops.items(), key=lambda x: -x[1])))
     add("")
     return "\n".join(lines)
 
@@ -726,8 +1168,16 @@ def run_mode(mode, args, run_dir):
                         mode_dir / "node0.ssh.log", live=True)
     _STATE["proc0"] = proc0
     threading.Thread(target=pump, args=(proc0,), daemon=True).start()
+    # 训练当中就把每步的 DP-PP 重叠率 / 通信压缩量打出来（node0 的原始行也会实时回显）
+    metrics_stop = threading.Event()
+    threading.Thread(target=live_metrics_loop,
+                     args=(mode, args.container,
+                           {0: mode_dir / "node0", 1: mode_dir / "node1"},
+                           metrics_stop),
+                     daemon=True).start()
     rc0, timed_out0 = wait_proc(proc0, args.timeout_s, "node0")
     rc1, timed_out1 = wait_proc(proc1, args.timeout_s, "node1")
+    metrics_stop.set()
     _STATE["proc0"] = _STATE["proc1"] = None
 
     for p in (proc0, proc1):
@@ -759,17 +1209,35 @@ def collect(rec, args):
     losses1 = _losses_from_text(read_text(NODES[1]["host"], args.container, node1 / "train.log"))
     step = parse_step_csv(NODES[0]["host"], args.container, node0)
 
-    dp_world = 2
+    dp_world = (args.gpus * 2) // max(args.pp * args.tp, 1)
     thr = None
     if step.get("total_step_s"):
         thr = step["num_steps"] * dp_world * args.micro_batches * args.seq_len / step["total_step_s"]
 
     traces = {0: find_traces(NODES[0]["host"], args.container, args.repo, rec["started"]),
               1: find_traces(NODES[1]["host"], args.container, args.repo, rec["started"])}
+
+    # 实时指标（每步一行，只有开 polar 的 mode 有）——node0/node1 各一份
+    rt0 = _rt_summary(parse_rt_metrics(
+        read_text(NODES[0]["host"], args.container, node0 / "train.log")))
+    rt1 = _rt_summary(parse_rt_metrics(
+        read_text(NODES[1]["host"], args.container, node1 / "train.log")))
+
+    # 端到端集合通信字节量（NCCL 自报口径），两节点各自统计
+    nccl0 = parse_nccl_bytes(NODES[0]["host"], args.container, node0)
+    nccl1 = parse_nccl_bytes(NODES[1]["host"], args.container, node1)
+    nccl_total = None
+    if (nccl0.get("total_bytes") is not None and nccl1.get("total_bytes") is not None
+            and nccl0.get("logs", 0) + nccl1.get("logs", 0) > 0):
+        nccl_total = nccl0["total_bytes"] + nccl1["total_bytes"]
+
     return {
         **rec,
         "final_loss_node0": losses0[-1][1] if losses0 else None,
         "final_loss_node1": losses1[-1][1] if losses1 else None,
+        "rt": {0: rt0, 1: rt1},
+        "nccl": {0: nccl0, 1: nccl1},
+        "nccl_total_bytes": nccl_total,
         "num_steps": step.get("num_steps"),
         "avg_step_s": step.get("avg_step_s"),
         "total_step_s": step.get("total_step_s"),
@@ -788,17 +1256,31 @@ def _fmt(v, nd=2):
     return f"{v:.{nd}f}" if v is not None else "-"
 
 
+def _rt_mean(r, key):
+    """两节点里能测到的那一侧的均值（node0 优先）。"""
+    for rank in (0, 1):
+        rt = (r.get("rt") or {}).get(rank)
+        if rt and rt.get(key) is not None:
+            return rt[key]
+    return None
+
+
 def summary_table(rows):
     hdr = (f"{'mode':10} {'exit0':>9} {'exit1':>9} {'loss0':>8} {'loss1':>8} "
-           f"{'steps':>5} {'avg_step_s':>10} {'tok/s':>9} {'traces':>6} {'GB':>7}")
+           f"{'steps':>5} {'avg_step_s':>10} {'tok/s':>9} {'traces':>6} {'GB':>7} "
+           f"{'overlap':>8} {'comm_GB':>9} {'压缩比':>8}")
     lines = [hdr, "-" * len(hdr)]
     for r in rows:
+        nccl_total = r.get("nccl_total_bytes")
         lines.append(
             f"{r['mode']:10} {str(r['exit0']):>9} {str(r['exit1']):>9} "
             f"{_fmt(r['final_loss_node0'], 4):>8} {_fmt(r['final_loss_node1'], 4):>8} "
             f"{str(r['num_steps'] or '-'):>5} {_fmt(r['avg_step_s']):>10} "
             f"{_fmt(r['throughput_tok_s'], 1):>9} "
-            f"{len(r['traces']):>6} {_fmt(r['trace_mb'] / 1024):>7}"
+            f"{len(r['traces']):>6} {_fmt(r['trace_mb'] / 1024):>7} "
+            f"{_fmt_pct(_rt_mean(r, 'rt_overlap_mean')):>8} "
+            f"{_fmt_gb(None if nccl_total is None else nccl_total / 1e9):>9} "
+            f"{_fmt(_rt_mean(r, 'rt_comm_reduction_mean')):>8}"
         )
     return "\n".join(lines)
 
@@ -814,6 +1296,25 @@ def compare(rows):
         out.append(f"吞吐   baseline={b['throughput_tok_s']:.1f} tok/s  "
                    f"mixed={m['throughput_tok_s']:.1f} tok/s  "
                    f"ratio={m['throughput_tok_s'] / b['throughput_tok_s']:.2f}x")
+    # 通信量：NCCL 自报的端到端 payload（压缩过的 DP + 未压缩的 TP/PP 都在内）
+    nb, nm = b.get("nccl_total_bytes") if b else None, m.get("nccl_total_bytes") if m else None
+    if nb and nm:
+        out.append(f"通信量 端到端 NCCL payload: baseline={_fmt_gb(nb / 1e9)}GB  "
+                   f"mixed={_fmt_gb(nm / 1e9)}GB  "
+                   f"降低={_fmt_gb((nb - nm) / 1e9)}GB ({nb / nm:.2f}x)")
+    # 实时口径：DP-PP 重叠率 / 压缩比（只有开 polar 的 mode 才测得到）
+    ov_b, ov_m = (_rt_mean(b, "rt_overlap_mean") if b else None), \
+                 (_rt_mean(m, "rt_overlap_mean") if m else None)
+    if ov_m is not None:
+        out.append(f"重叠率 DP-PP（实时均值）: baseline={_fmt_pct(ov_b)}  mixed={_fmt_pct(ov_m)}")
+    elif b and m:
+        out.append("重叠率 DP-PP: 实时口径未测到（baseline 不开 polar），"
+                   "dense 侧参考上面 trace 标注的 DP∩PP 估计")
+    red = _rt_mean(m, "rt_comm_reduction_mean") if m else None
+    if red is not None:
+        out.append(f"压缩比（实时均值）: mixed {red:.2f}x   "
+                   f"每步 dense={_fmt_gb(_rt_mean(m, 'rt_comm_dense_gb'))}GB → "
+                   f"compressed={_fmt_gb(_rt_mean(m, 'rt_comm_compressed_gb'))}GB")
     if b and m:
         bit = [f"loss baseline={_fmt(b.get('final_loss_node0'), 4)} "
                f"mixed={_fmt(m.get('final_loss_node0'), 4)}"]
@@ -829,8 +1330,11 @@ def make_arg_parser():
     p = argparse.ArgumentParser(
         description="跨机 Qwen14B：mixed/baseline 各 10 iter + profiler 8/9 iter + 自动分析",
         epilog="必须在 powerone1 的宿主机上运行（容器里没有 docker）。")
-    p.add_argument("--modes", default="mixed,baseline",
-                   help="逗号分隔，可选 baseline|polar_dense|bitscom|mixed（按顺序跑）")
+    p.add_argument("--modes", default=None,
+                   help="逗号分隔，可选 baseline|polar_dense|bitscom|mixed（按顺序跑；"
+                        "不写则默认 mixed,baseline）")
+    p.add_argument("--only-baseline", action="store_true",
+                   help="只跑 baseline、不跑 mixed（等价于 --modes baseline，二者同时给出时以本参数为准）")
     p.add_argument("--repo", default=DEFAULT_REPO, help="两台机器上相同的仓库根路径")
     p.add_argument("--container", default="trj-udtca")
     p.add_argument("--ssh-target", default=SSH["target"], help="ssh 到 node1 的目标（默认 powerone2）")
@@ -840,8 +1344,8 @@ def make_arg_parser():
     p.add_argument("--max-steps", type=int, default=10)
     p.add_argument("--micro-batches", type=int, default=16)
     p.add_argument("--seq-len", type=int, default=256)
-    p.add_argument("--gpus", type=int, default=8, help="每台机器的卡数")
-    p.add_argument("--pp", type=int, default=4)
+    p.add_argument("--gpus", type=int, default=16, help="每台机器的卡数")
+    p.add_argument("--pp", type=int, default=8)
     p.add_argument("--tp", type=int, default=2)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--master-port", type=int, default=29630)
@@ -851,7 +1355,12 @@ def make_arg_parser():
                    help="单节点最长等待（默认不限；到点只停止等待，不杀进程）")
     p.add_argument("--no-analyze", action="store_true", help="跑完不做 trace 分析")
     p.add_argument("--skip-preflight", action="store_true", help="跳过启动前检查")
-    p.add_argument("--preflight-only", action="store_true", help="只做启动前检查")
+    p.add_argument("--skip-card-check", action="store_true",
+                   help="跳过卡占用 / page fault / vmid 检查（默认不跳过）")
+    p.add_argument("--gpu-mem-threshold", type=int, default=GPU_MEM_THRESHOLD_MIB,
+                   help=f"单卡显存超过多少 MiB 算被占用（默认 {GPU_MEM_THRESHOLD_MIB}）")
+    p.add_argument("--preflight-only", action="store_true",
+                   help="只做启动前检查（含卡占用 / 卡健康）")
     p.add_argument("--dry-run", action="store_true", help="只打印生成的脚本")
     return p
 
@@ -863,7 +1372,13 @@ def main():
     if args.ssh_opts.strip():
         SSH["opts"] = shlex.split(args.ssh_opts)
 
-    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    if args.only_baseline:
+        if args.modes and [m.strip() for m in args.modes.split(",") if m.strip()] != ["baseline"]:
+            print(f"--only-baseline 与 --modes {args.modes} 同时给出，以 --only-baseline 为准（只跑 baseline）",
+                  file=sys.stderr)
+        modes = ["baseline"]
+    else:
+        modes = [m.strip() for m in (args.modes or "mixed,baseline").split(",") if m.strip()]
     for m in modes:
         if m not in METHOD_ARGS:
             print(f"未知 mode: {m}", file=sys.stderr)
@@ -890,13 +1405,19 @@ def main():
     if not args.skip_preflight and not preflight(args):
         return 2
     if args.preflight_only:
-        return 0
+        if args.skip_card_check:
+            return 0
+        return 0 if card_precheck(args) else 3
 
     install_signal_handlers(args)
     run_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     try:
         for mode in modes:
+            # 每个 mode 起训前都过一遍：卡被占 / 有 page fault·vmid 就整轮不跑
+            if not args.skip_card_check and not card_precheck(args, when=mode):
+                print(f"\n卡不可用，{mode} 及后续 mode 都不启动。")
+                break
             _STATE["active"] = True
             rec = run_mode(mode, args, run_dir)
             rows.append(collect(rec, args))
@@ -906,15 +1427,21 @@ def main():
         cleanup_nodes(args, f"异常 {exc.__class__.__name__}: {exc}")
         raise
 
+    if not rows:
+        print("\n所有 mode 都因卡不可用被跳过，没有产生任何训练结果。")
+        return 3
+
     table = summary_table(rows)
     cmp_text = compare(rows)
     analysis = "" if args.no_analyze else analysis_report(rows, args)
+    metrics = metrics_report(rows, args)
 
     print(f"\n{'=' * 78}\n汇总\n{'=' * 78}")
     print(table, "\n")
     print(cmp_text)
     if analysis:
         print("\n" + analysis)
+    print("\n" + metrics)
 
     header = (f"# 跨机 Qwen14B 汇总\n\nrun_dir: {run_dir}\n\n"
               f"## 汇总表\n```\n{table}\n```\n\n## 对比\n```\n{cmp_text}\n```\n")
@@ -924,18 +1451,22 @@ def main():
         details.append(f"- case: {r['case_dir']}")
         for t in r["traces"]:
             details.append(f"- trace {t['mb']} MB: {t['path']}")
-    md = header + "\n## 分析\n```\n" + analysis + "\n```\n" + "\n".join(details) + "\n"
+    md = (header + "\n## 实时指标与通信量\n```\n" + metrics + "\n```\n"
+          + ("\n## 分析\n```\n" + analysis + "\n```\n" if analysis else "")
+          + "\n".join(details) + "\n")
 
     (run_dir / "summary.json").write_text(
         json.dumps({"run_dir": str(run_dir), "modes": rows, "compare": cmp_text},
                    indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
     (run_dir / "summary.md").write_text(md, encoding="utf-8")
+    (run_dir / "metrics.log").write_text(metrics + "\n", encoding="utf-8")
     if analysis:
         (run_dir / "analysis.log").write_text(analysis + "\n", encoding="utf-8")
 
     print(f"\n结果已写入:")
     print(f"  {run_dir}/summary.md")
     print(f"  {run_dir}/summary.json")
+    print(f"  {run_dir}/metrics.log")
     if analysis:
         print(f"  {run_dir}/analysis.log")
     return 0
