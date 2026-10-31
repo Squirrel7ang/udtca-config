@@ -131,14 +131,11 @@ export TORCH_NCCL_ENABLE_MONITORING="${TORCH_NCCL_ENABLE_MONITORING:-0}"
 export TORCH_NCCL_DUMP_ON_TIMEOUT=1
 export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
 export TORCH_FR_BUFFER_SIZE=1048576
-# 看门狗只管“多久没进度就 revoke 收尾”，不做 kill。跨机首步本来就慢，放宽到 600 s。
+# 通信超时基线；卡住时由外部 kill -9 处理，torch 自己不 abort。跨机首步慢，放宽到 600 s。
 export UDTCA_COMM_WATCHDOG_S="${UDTCA_COMM_WATCHDOG_S:-600}"
 export UDTCA_HTTP_READ_TIMEOUT_S="${UDTCA_HTTP_READ_TIMEOUT_S:-30}"
 export UDTCA_DATASET_RETRIES="${UDTCA_DATASET_RETRIES:-3}"
 export UDTCA_DATASET_STALL_S="${UDTCA_DATASET_STALL_S:-120}"
-export UDTCA_REVOKE_QUIESCE_S="${UDTCA_REVOKE_QUIESCE_S:-10}"
-export UDTCA_REVOKE_BARRIER_S="${UDTCA_REVOKE_BARRIER_S:-5}"
-export UDTCA_REVOKE_FILE="${UDTCA_REVOKE_FILE:-}"
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_DEBUG_FILE="$CASE_DIR/logs/nccl.%h.%p.log"
@@ -184,9 +181,9 @@ torchrun \
   "${METHOD_ARGS[@]}" \
   --num-workers 0 \
   --disable-profiler "$DISABLE_PROFILER" \
-  --profiler-wait-steps 0 \
-  --profiler-warmup-steps 0 \
-  --profiler-active-steps "$MAX_STEPS" \
+  --profiler-wait-steps "${PROFILER_WAIT_STEPS:-0}" \
+  --profiler-warmup-steps "${PROFILER_WARMUP_STEPS:-0}" \
+  --profiler-active-steps "${PROFILER_ACTIVE_STEPS:-$MAX_STEPS}" \
   --profiler-repeat 1 \
   --debug-nan-steps 2 \
   --save-dir "$CASE_DIR/ckpt" \

@@ -143,7 +143,7 @@ export TORCH_NCCL_ENABLE_MONITORING="${TORCH_NCCL_ENABLE_MONITORING:-0}"
 export TORCH_NCCL_DUMP_ON_TIMEOUT=1
 export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
 export TORCH_FR_BUFFER_SIZE=1048576
-# 看门狗只管“多久没进度就 revoke 收尾”，不做 kill。首步本来就慢，放宽到 600 s。
+# 通信超时基线；卡住时由外部 kill -9 处理，torch 自己不 abort。首步慢，放宽到 600 s。
 export UDTCA_COMM_WATCHDOG_S="${UDTCA_COMM_WATCHDOG_S:-600}"
 # 解析数据集目录时 huggingface_hub 的 client 没有读超时，镜像断流会无限挂起；
 # entry 会给每个 httpx 请求补读超时并做有限次重试，这里是对应的上限。
@@ -151,9 +151,6 @@ export UDTCA_HTTP_READ_TIMEOUT_S="${UDTCA_HTTP_READ_TIMEOUT_S:-30}"
 export UDTCA_DATASET_RETRIES="${UDTCA_DATASET_RETRIES:-3}"
 # 单次解析超过这个秒数没返回，就把所有线程栈打进日志（定位用，不中断训练）
 export UDTCA_DATASET_STALL_S="${UDTCA_DATASET_STALL_S:-120}"
-export UDTCA_REVOKE_QUIESCE_S="${UDTCA_REVOKE_QUIESCE_S:-10}"
-export UDTCA_REVOKE_BARRIER_S="${UDTCA_REVOKE_BARRIER_S:-5}"
-export UDTCA_REVOKE_FILE="${UDTCA_REVOKE_FILE:-}"
 # NCCL 全量 INFO 落文件（每 rank 一个）。NCCL_DEBUG_FILE 生效后 NCCL 不再往
 # 控制台打，控制台没有 NCCL 行 ≠ 变量没设上 —— 看 $CASE_DIR/logs/。
 export NCCL_DEBUG=INFO

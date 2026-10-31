@@ -122,7 +122,7 @@ RUN_LOG="$CASE_DIR/run.log"
 TEE=(tee -a "$CASE_DIR/train.log" "$RUN_LOG")
 
 # 环境变量对齐 run.py / generate_and_run.py（common/case_common.py 的 SETUP_CMDS +
-# orchestrator 的 NCCL 集合通信日志）。排查性能瓶颈期间只留这些，不额外加诊断/revoke 变量。
+# orchestrator 的 NCCL 集合通信日志）。排查性能瓶颈期间只留这些，不额外加诊断变量。
 
 # ---- 容器内 Corex 环境（两台强制一致）----
 export COREX_PATH=/usr/local/corex

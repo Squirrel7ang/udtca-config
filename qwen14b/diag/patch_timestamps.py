@@ -4,7 +4,6 @@
 只改打印前缀，不动任何逻辑：
   hooks.py    _dbg():            `[dbg  694.936s ...]` -> `[dbg 10-31 08:36:35.123  694.936s ...]`
               _polar_hook_debug(): 加同样的时钟
-  wrapper.py  [comm-watchdog]   各条打印带上时钟
 
 用法: python3 patch_timestamps.py <hooks.py> <wrapper.py>
 可重复执行（已打过的锚点不再匹配，脚本会报 already patched）。
@@ -63,25 +62,6 @@ def main():
             ),
         ],
         helper_anchor='def _polar_hook_debug(message: str) -> None:',
-    )
-
-    patch(
-        wrapper,
-        [
-            (
-                'print(f"[comm-watchdog] comm capture failed: {exc!r}", flush=True)',
-                'print(f"[comm-watchdog] {_wall_clock()} comm capture failed: {exc!r}", flush=True)',
-            ),
-            (
-                'print("[comm-watchdog] nccl_revoke unavailable; not exiting", flush=True)',
-                'print(f"[comm-watchdog] {_wall_clock()} nccl_revoke unavailable; not exiting", flush=True)',
-            ),
-            (
-                'print(f"[comm-watchdog] shutdown failed: {exc!r}", flush=True)',
-                'print(f"[comm-watchdog] {_wall_clock()} shutdown failed: {exc!r}", flush=True)',
-            ),
-        ],
-        helper_anchor="class _CommWatchdog",
     )
 
 

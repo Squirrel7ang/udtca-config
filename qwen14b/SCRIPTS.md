@@ -47,8 +47,10 @@ phase1/phase2/restore 共用同一个 comm，多个 bucket 同时在飞时两个
 投递顺序会分叉、偶发卡死；串行后一个 bucket 完全 restore 才发下一个。正确性优先，
 关掉大约快 12%（u13+u177 2gbit 实测）。
 
-**不要用 `timeout` 或 SIGTERM 停它**：Corex 上 NCCL 进程被打断会让卡永久挂死
-（XID 24），只能重启机器。要停就让 entry 自己的通信看门狗走 revoke 路径退出。
+**停训练直接 `pkill -9` 全部 rank 和 torchrun 进程**，一次杀干净；不要用 SIGTERM
+挨个协商退出（卡在 NCCL C 代码里的子进程收不到，只会拖时间）。
+
+不要给训练套 `timeout`：Corex 上被外部超时打断的 NCCL 有概率让卡挂死（XID 24）。
 
 常用覆盖项（都能放在命令行前缀）：
 

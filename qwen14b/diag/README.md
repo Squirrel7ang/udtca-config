@@ -15,7 +15,6 @@ python3 udtca-config/qwen14b/diag/patch_timestamps.py \
 
 - `hooks.py` 的 `_dbg()`：`[dbg  694.936s ...]` → `[dbg 10-31 08:36:35.123  694.936s ...]`
 - `hooks.py` 的 `_polar_hook_debug()`：同样加时钟
-- `wrapper.py` 的 `[comm-watchdog]` 各条打印
 
 为什么：原来的 `[dbg ...]` 只有进程内的相对秒数，机器卡死之后没法跟 `dmesg` / NCCL 日志 /
 内核 XID 对上时间。加了墙上时钟以后，内核里冒出来的错误能直接对应"当时代码走到哪一行"。
