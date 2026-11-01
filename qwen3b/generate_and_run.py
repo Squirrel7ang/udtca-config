@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""按 test.json 依次跑 Qwen3B 实验（POLAR + bitscom / baseline 两条路径）。
+
+每条配置按它自己的 `baseline` 标记分派：
+  - baseline 为真  -> 复用仓库里现成的 0/1_train_qwen3b_baseline_ddp_1f1b_tp.sh
+  - 否则           -> 生成 POLAR + bitscom 的 0/1_train_qwen3b_exp{index}.sh 再跑
+
+每次运行占用一个递增的 case 编号，tensorboard / profiler trace / step csv 都收到
+<repo>/runtime_log/<case>/ 下，启动脚本与参数记在 runtime_log/case.json。
+
+生成脚本 / 下发 / 限速 / 起训 / 收日志这些与实验无关的流程在 common/orchestrator.py，
+这里只留 Qwen3B 自己的：spec + 启动参数。
+
+用法：
+    python generate_and_run.py                    # 跑 test.json 全部
+    python generate_and_run.py --only 1,3         # 只跑指定 index
+    python generate_and_run.py --runtime-log off  # 冒烟：不归档，只验证能跑通
+"""
+
+import sys
+from collections import OrderedDict
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
+
+import case_common as cc  # noqa: E402
+from orchestrator import make_arg_parser, run_experiments  # noqa: E402
+
+QWEN3B_SPEC = cc.ExperimentSpec(
+    name="qwen3b",
+    experiment_dir=cc.REPO_ROOT / "experiments" / "qwen3b",
+    entry_script="run_qwen3b_polar_dp_pp_tp.py",
+    config_dir=cc.CONFIG_ROOT / "qwen3b",
+    remote_experiment_dir=f"{cc.REMOTE_BASE_DIR}/experiments/qwen3b",
+    # 和 experiments/qwen3b/ 下手写脚本、run_docker 的默认端口错开 14B 那一套
+    # （14B 用 29500/29501、29693），同一台机器上大小模型可以各跑各的。
+    master_port="29520",
+)
+
+# 生成的 POLAR 脚本叫 0_{SCRIPT_PREFIX}_exp{index}.sh
+SCRIPT_PREFIX = "train_qwen3b"
+# 仓库里现成的 baseline 脚本（node0 本地 / node1 远程）
+BASELINE_SCRIPTS = (
+    "0_train_qwen3b_baseline_ddp_1f1b_tp.sh",
+    "1_train_qwen3b_baseline_ddp_1f1b_tp.sh",
+)
+BASELINE_RUN_LABEL = "baseline_ddp_1f1b_tp"
+
+
+def build_launch_params(config: Dict[str, Any], node_rank: int,
+                        case_dir: "Optional[Path]") -> "OrderedDict":
+    """POLAR + bitscom 这条路径的启动参数，生成的脚本和 case.json 都从这里渲染。"""
+    micro_batches = config["micro-batches"]
+    params = OrderedDict(
+        [
+            ("model-name", "Qwen/Qwen2.5-3B-Instruct"),
+            ("pp-size", config["pp-size"]),
+            ("tp-size", config["tp-size"]),
+            ("micro-batches", micro_batches),
+            ("comm-timing", 8),
+            ("max-steps", config["max-steps"]),
+            ("per-device-batch-size", micro_batches),
+            ("seq-len", config["seq-len"]),
+            ("lr", "2e-4"),
+            ("dataset-name-or-path", "HuggingFaceFW/fineweb"),
+            ("text-field", "text"),
+            ("using-polar", True),
+            ("run-label", "polar_bitscom_1f1b_tp"),
+            ("polar-hook", "ef_lowmem"),
+            ("polar-bucket-numel", 64000000),
+            # 两个 DP rank 的 bucket 调度规则必须完全一致：max_inflight 不同，
+            # 两侧 phase1/phase2/restore 的投递时机就会分叉，lowbit 的 p2p
+            # 对不上就直接卡死。这里不能按 node_rank 取不同值。
+            # 1 与 run_single_node.sh / SCRIPTS.md 的默认值一致。
+            ("polar-max-inflight-buckets", 1),
+            ("method", "bitscom"),
+            ("bitwidth", config["bit-width"]),
+            # 每 10 步打一次 step/loss（polar-sgd 的 wrapper 读这个值）
+            ("log-interval", 10),
+        ]
+    )
+    if case_dir is not None:
+        params["step-log-dir"] = str(case_dir / "step_csv")
+    # profiler 必须开：显式写 False（入口脚本的默认值也是 False），
+    # 这样生成的脚本和 case.json 里都能直接看到这个设置。
+    params["disable-profiler"] = False
+    return params
+
+
+def main():
+    args = make_arg_parser("按 test.json 跑 Qwen3B 实验").parse_args()
+    run_experiments(
+        QWEN3B_SPEC,
+        args,
+        build_params=build_launch_params,
+        script_prefix=SCRIPT_PREFIX,
+        baseline_scripts=BASELINE_SCRIPTS,
+        baseline_run_label=BASELINE_RUN_LABEL,
+    )
+
+
+if __name__ == "__main__":
+    main()

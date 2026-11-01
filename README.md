@@ -23,6 +23,11 @@ udtca-config/
 │   └── _run_baseline.py     内部脚本：只跑 baseline 的入口（一般不用直接调用）
 ├── qwenvl8b/                Qwen3-VL-8B 实验（PP=8 TP=1 DP=4），结构与 qwen14b 一一对应
 │   ├── default.json  test.json  generate_and_run.py  _run_baseline.py
+├── qwen3b/                  Qwen2.5-3B 实验（PP=8 TP=2 DP=2），qwen14b 的同构副本
+│   ├── default.json  test.json  run_cases.json
+│   ├── generate_and_run.py  run.py  _run_baseline.py
+│   └── run_docker.py        跨机容器版启动器（与 qwen14b 同构，端口错开）
+│                           小模型用来在不同卡数/并行度上快速扫对照结果，见 qwen3b/README.md
 └── utils/                   与具体实验无关的辅助脚本
     ├── watch_bandwidth.py   实时看两机之间的网卡带宽
     ├── collect_case_logs.py 把深层 ./log/... 拍平成 tb_scalars/tb_trace/step_csv
@@ -97,10 +102,11 @@ ixsmi | grep MiB                     # 两节点的卡都空闲（runner 自己�
 ```bash
 cd /data1/tangruijing/udtca
 python udtca-config/qwen14b/generate_and_run.py          # Qwen14B 全矩阵
+python udtca-config/qwen3b/generate_and_run.py           # Qwen3B 全矩阵（同一套流程，跑得快）
 python udtca-config/qwenvl8b/generate_and_run.py         # QwenVL8B 全矩阵
 ```
 
-常用参数（两个实验通用）：
+常用参数（各实验通用）：
 
 ```bash
 --only 1,3           # 只跑指定 index
@@ -133,16 +139,20 @@ python udtca-config/qwen14b/_run_baseline.py    # 内部脚本，只跑 test.jso
 
 `test.json` 的 `index` 就是运行顺序，没写的字段从同目录 `default.json` 继承。
 
-| | qwen14b | qwenvl8b |
-|---|---|---|
-| 模型 | `Qwen/Qwen2.5-14B-Instruct` | `Qwen/Qwen3-VL-8B-Instruct` |
-| 并行 | pp 8 / tp 2 / dp 2 | pp 8 / tp 1 / dp 4 |
-| 训练入口 | `run_qwen14b_polar_dp_pp_tp.py` | `run_qwenvl8b_polar_dp_pp.py` |
-| 数据 | `HuggingFaceFW/fineweb`（流式 + 节点本地 token 缓存） | 随机张量（`--data-seed` 可复现） |
-| 当前 case 数 | 4（rate 2/2/1/1 gbit，POLAR 与 baseline 交替） | 4，同上 |
+| | qwen14b | qwen3b | qwenvl8b |
+|---|---|---|---|
+| 模型 | `Qwen/Qwen2.5-14B-Instruct` | `Qwen/Qwen2.5-3B-Instruct` | `Qwen/Qwen3-VL-8B-Instruct` |
+| 并行 | pp 8 / tp 2 / dp 2 | pp 8 / tp 2 / dp 2（TP 只能 1/2） | pp 8 / tp 1 / dp 4 |
+| 训练入口 | `run_qwen14b_polar_dp_pp_tp.py` | `run_qwen3b_polar_dp_pp_tp.py` | `run_qwenvl8b_polar_dp_pp.py` |
+| 数据 | `HuggingFaceFW/fineweb`（流式 + 节点本地 token 缓存） | 同左 | 随机张量（`--data-seed` 可复现） |
+| 当前 case 数 | 4（rate 2/2/1/1 gbit，POLAR 与 baseline 交替） | 4，同左 | 4，同上 |
+
+> qwen3b 是 qwen14b 的**同构缩小版**（模型 3B、其余代码与参数一一对应，端口错开），
+> 用来在不同卡数/并行度上快速扫对照结果，再回 14B 复验。细节见
+> [`qwen3b/README.md`](qwen3b/README.md)。
 
 当前超参（`default.json`）：`max-steps=30`、`seq-len=256`、
-qwen14b `micro-batches=32`、qwenvl8b `micro-batches=8`；`--log-interval 10`，每 10 步打一行。
+qwen14b / qwen3b `micro-batches=32`、qwenvl8b `micro-batches=8`；`--log-interval 10`，每 10 步打一行。
 
 ## 脚本用法
 
@@ -152,6 +162,8 @@ qwen14b `micro-batches=32`、qwenvl8b `micro-batches=8`；`--log-interval 10`，
 | `qwen14b/run.py` | 固定跑 `run_cases.json` 里的 4 个 case，跑完打印对比表 + `summary.md/json` | `python .../qwen14b/run.py [--max-steps 3] [--no-tc]` |
 | `qwen14b/start_metrics_api.py` | 起实时指标 API，`--with-training` 可同时拉起 `run.py` | `python .../qwen14b/start_metrics_api.py --port 8000 [--with-training]` |
 | `qwen14b/_run_baseline.py` | 内部脚本：只跑 `baseline=True` 的条目，共用同一套 case 编号 | 一般不用直接调用，`generate_and_run.py --only` 即可 |
+| `qwen3b/generate_and_run.py` | Qwen3B 主入口，行为同上（端口 29520） | `python .../qwen3b/generate_and_run.py [--only 1]` |
+| `qwen3b/run_docker.py` | Qwen3B 跨机容器版启动器，可调 `--gpus/--pp/--tp` 扫不同卡数 | `python3 .../qwen3b/run_docker.py --modes mixed --max-steps 5` |
 | `qwenvl8b/generate_and_run.py` | QwenVL8B 主入口，行为同上 | 同上 |
 | `qwenvl8b/_run_baseline.py` | QwenVL8B 内部脚本：只跑 baseline | 同上 |
 | `common/case_common.py` | 被上面 4 个 import。定义 `ExperimentSpec`、`SETUP_CMDS`（两节点环境对齐）、`ssh_execute`（base64 传远程脚本）、`check_gpus_free`、`allocate_case`、`write_launch_script` 等 | 不单独运行 |
