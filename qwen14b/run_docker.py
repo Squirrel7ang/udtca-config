@@ -24,6 +24,9 @@
      * 通信量：`logs/nccl_*.log` 里 NCCL 自报的集合通信 payload 字节，两节点合计
        （口径同 udtca-config/utils/parse_nccl_bytes.py）。
      结果同时打到终端和 `<run>/analysis.log`、`<run>/metrics.log`、`<run>/summary.md`。
+     此外本次运行的**完整** stdout/stderr（横幅、预检、两机 torchrun 实时输出、
+     汇总、分析）从一开始就同时落到 `<run>/run_docker.stdout.log`，不依赖调用方
+     把输出重定向到 /tmp。
      baseline vs mixed 的对比里包含步时/吞吐、端到端通信量与降低倍数、重叠率、压缩比。
 
 profiler：**无条件关闭**（生成的脚本固定 `--disable-profiler true`）。这版 Corex
@@ -1395,6 +1398,42 @@ def make_arg_parser():
     return p
 
 
+class _Tee:
+    """把写往终端的内容同时写一份到文件。
+
+    编排脚本的 stdout 里有启动横幅、预检、两机 torchrun 的实时输出、汇总表和
+    分析，这些都不该只活在启动它的那个终端（或 nohup 的 /tmp 文件）里。run_dir
+    一确定就把 stdout/stderr 套上这个 tee，本次运行一结束，run_dir 里就有一份
+    完整记录。
+    """
+
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log_file = log_file
+
+    def write(self, data):
+        self._stream.write(data)
+        self._log_file.write(data)
+        return len(data)
+
+    def flush(self):
+        self._stream.flush()
+        self._log_file.flush()
+
+    def __getattr__(self, name):  # encoding / isatty / fileno 等一律转发
+        return getattr(self._stream, name)
+
+
+def _install_stdout_log(run_dir):
+    """run_dir 建好后把 stdout/stderr 复制一份到 run_dir/run_docker.stdout.log。"""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_file = open(run_dir / "run_docker.stdout.log", "a",
+                    buffering=1, encoding="utf-8", errors="replace")
+    sys.stdout = _Tee(sys.stdout, log_file)
+    sys.stderr = _Tee(sys.stderr, log_file)
+    return log_file
+
+
 def main():
     args = make_arg_parser().parse_args()
     args._ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1415,6 +1454,11 @@ def main():
             return 2
 
     run_dir = Path(args.repo) / "run_log" / f"xnode_{args._ts}"
+    if not args.dry_run:
+        # 从这一行起，所有 stdout/stderr（含后面两机 torchrun 的实时输出、汇总、
+        # 分析）都同时写进 run_dir/run_docker.stdout.log；不再依赖调用方把
+        # nohup 的输出重定向到 /tmp。
+        _install_stdout_log(run_dir)
     print("=" * 78)
     print(f"跨机训练  modes={modes}  steps={args.max_steps}  "
           f"GPUS={args.gpus}/节点 DP={2 * args.gpus // (args.pp * args.tp)} "
