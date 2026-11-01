@@ -27,7 +27,8 @@
      此外本次运行的**完整** stdout/stderr（横幅、预检、两机 torchrun 实时输出、
      汇总、分析）从一开始就同时落到 `<run>/run_docker.stdout.log`，不依赖调用方
      把输出重定向到 /tmp。
-     baseline vs mixed 的对比里包含步时/吞吐、端到端通信量与降低倍数、重叠率、压缩比。
+     baseline vs mixed 的对比里包含步时/吞吐、DP-PP 重叠率、DP 通信压缩比。
+     （端到端 NCCL 通信量只落 summary.json，不输出：里面混着单机的 TP/PP 流量。）
 
 profiler：**无条件关闭**（生成的脚本固定 `--disable-profiler true`）。这版 Corex
 栈上 CUPTI 一采集，设备侧 kernel 就不再完成（2026-11-01 两轮复现：进 profiler 后
@@ -699,8 +700,8 @@ def _losses_from_text(text):
 #               comm_dense=2.4303GB comm_compressed=313.2745MB
 #               comm_saved=2.1170GB comm_reduction=7.76x
 #
-# 只有开了 polar 的 mode（polar_dense / mixed）才有这行；baseline / bitscom 没有，
-# 这时不能当成 0，要如实报「未测到」。
+# 四种 mode 都会打这行：baseline / bitscom 的 DP 同步是串行做的，重叠率应该是 0%，
+# DP 通信量那几项没有（不走 bitscom 压缩）。真拿不到时如实报「未测到」，不要当成 0。
 
 _RT_RE = re.compile(r"\[rt-metric\]\s+(.*)")
 _KV_RE = re.compile(r"(\w+)=([^\s]+)")
@@ -785,8 +786,13 @@ def _rt_summary(rt):
 # 口径与 udtca-config/utils/parse_nccl_bytes.py 一致：NCCL 的集合通信行（COLL 子
 # 系统）都带 count 和 datatype，乘起来就是「交给网络的那块 buffer」的字节数。这里
 # 用 SUBSYS=ALL 是为了诊断信息齐全，只匹配 "<Op> ... count ... datatype" 行，不受影响。把该 case
-# 所有 rank 加起来 = 这一跑端到端真正通信的量（压缩过的 DP + 未压缩的 TP/PP 都在内）。
+# 所有 rank 加起来 = 这一跑真正通信的量（压缩过的 DP + 未压缩的 TP/PP 都在内）。
 # 比读网卡计数器干净：k8s 节点上还有别的租户流量。
+#
+# 注意：这个数**不用于汇报**。优化的收益只在跨机的 DP 同步上，而这里面混着大量
+# 单机内的 TP all-reduce / PP p2p / 参数 broadcast，比值会被稀释得没有意义。
+# 跨机效果看 [rt-metric] 的 comm_dense/comm_compressed 与 DP-PP 重叠率。
+# 数据仍然留在 summary.json 里备查。
 #
 # 日志在容器里，脚本也在容器里跑，只把聚合结果带回来。
 
@@ -835,7 +841,7 @@ print(json.dumps({
 
 
 def parse_nccl_bytes(host, container, case_dir):
-    """在容器里扫 logs/nccl*.log，返回端到端集合通信字节量。扫不到就返回 logs=0。"""
+    """在容器里扫 logs/nccl*.log，返回集合通信字节量。扫不到就返回 logs=0。"""
     argv = _on(host, f"docker exec -i {container} python3 - {shlex.quote(str(case_dir))}")
     try:
         proc = subprocess.run(argv, input=NCCL_COLL_CODE, capture_output=True,
@@ -1100,10 +1106,10 @@ def metrics_report(rows, args):
     lines = []
     add = lines.append
     add("=" * 78)
-    add("实时指标（[rt-metric] 每步一条）与端到端集合通信量")
+    add("实时指标（[rt-metric] 每步一条）")
     add("=" * 78)
     add("  [rt-metric] 来自 polar wrapper（polar-sgd/src/psgd/parallelism/polar/wrapper.py），")
-    add("  和 run.py / metrics_api.py 同源；只有开了 polar 的 mode（polar_dense/mixed）才有。")
+    add("  和 run.py / metrics_api.py 同源；四种 mode 都有（baseline/bitscom 的重叠率预期为 0%）。")
 
     for r in rows:
         add(f"\n## {r['mode']}   EXIT_CODE node0={r['exit0']} node1={r['exit1']}")
@@ -1111,9 +1117,13 @@ def metrics_report(rows, args):
             rt = r["rt"][rank]
             name = NODES[rank]["name"]
             if not rt:
-                add(f"  node{rank} {name}: 没有 [rt-metric]"
-                    + ("（baseline/bitscom 不开 polar，DP 重叠率与压缩量无从谈起）"
-                       if r["mode"] in ("baseline", "bitscom") else "（训练没进到打印指标那一步）"))
+                # 指标固定只由 node0 上的 DP-rank0 + 最后一个 stage + TP-rank0 打印，
+                # node1 按设计就查不到；这行说明是预期行为，不是故障。
+                if rank == 1:
+                    note = "（指标固定由 node0 的 DP-rank0/末级 stage/TP-rank0 打印，本节点按设计不出）"
+                else:
+                    note = "（该 mode 没有走到指标打印点）"
+                add(f"  node{rank} {name}: 没有 [rt-metric]{note}")
                 continue
             add(f"  node{rank} {name}: {rt['rt_steps']} 步有指标")
             for d in rt["rt_steps_detail"]:
@@ -1129,25 +1139,8 @@ def metrics_report(rows, args):
                 f"saved={_fmt_gb(rt['rt_comm_saved_gb'])}GB "
                 f"压缩比={_fmt(rt['rt_comm_reduction_mean'], 2)}x")
 
-        nc0, nc1 = r["nccl"][0], r["nccl"][1]
-        total = r.get("nccl_total_bytes")
-        if total is None:
-            why = (nc0.get("error") or nc1.get("error")
-                   or "没有 logs/nccl*.log（NCCL_DEBUG 未生效或训练没起来）")
-            add(f"  端到端集合通信量: 未测得（{why}）")
-        else:
-            add(f"  端到端集合通信量（NCCL COLL payload，两节点合计）: "
-                f"{_fmt_gb(total / 1e9)} GB  "
-                f"(node0 {_fmt_gb(nc0['total_bytes'] / 1e9)} GB / "
-                f"node1 {_fmt_gb(nc1['total_bytes'] / 1e9)} GB, "
-                f"{nc0.get('logs', 0) + nc1.get('logs', 0)} 个 rank 日志)")
-            ops = {}
-            for nc in (nc0, nc1):
-                for op, gb in (nc.get("by_op_gb") or {}).items():
-                    ops[op] = ops.get(op, 0.0) + gb
-            if ops:
-                add("    按算子: " + "  ".join(f"{k}={v:.3f}GB"
-                                             for k, v in sorted(ops.items(), key=lambda x: -x[1])))
+        # 端到端 NCCL 通信量（含单机 TP/PP）不输出：优化只作用于跨机的 DP 同步，
+        # 混进单机流量后这个比值没有意义。原始数据仍在 summary.json 里备查。
     add("")
     return "\n".join(lines)
 
@@ -1297,10 +1290,9 @@ def _rt_mean(r, key):
 def summary_table(rows):
     hdr = (f"{'mode':10} {'exit0':>9} {'exit1':>9} {'loss0':>8} {'loss1':>8} "
            f"{'steps':>5} {'avg_step_s':>10} {'tok/s':>9} {'traces':>6} {'GB':>7} "
-           f"{'overlap':>8} {'comm_GB':>9} {'压缩比':>8}")
+           f"{'overlap':>8} {'压缩比':>8}")
     lines = [hdr, "-" * len(hdr)]
     for r in rows:
-        nccl_total = r.get("nccl_total_bytes")
         lines.append(
             f"{r['mode']:10} {str(r['exit0']):>9} {str(r['exit1']):>9} "
             f"{_fmt(r['final_loss_node0'], 4):>8} {_fmt(r['final_loss_node1'], 4):>8} "
@@ -1308,7 +1300,6 @@ def summary_table(rows):
             f"{_fmt(r['throughput_tok_s'], 1):>9} "
             f"{len(r['traces']):>6} {_fmt(r['trace_mb'] / 1024):>7} "
             f"{_fmt_pct(_rt_mean(r, 'rt_overlap_mean')):>8} "
-            f"{_fmt_gb(None if nccl_total is None else nccl_total / 1e9):>9} "
             f"{_fmt(_rt_mean(r, 'rt_comm_reduction_mean')):>8}"
         )
     return "\n".join(lines)
@@ -1325,19 +1316,16 @@ def compare(rows):
         out.append(f"吞吐   baseline={b['throughput_tok_s']:.1f} tok/s  "
                    f"mixed={m['throughput_tok_s']:.1f} tok/s  "
                    f"ratio={m['throughput_tok_s'] / b['throughput_tok_s']:.2f}x")
-    # 通信量：NCCL 自报的端到端 payload（压缩过的 DP + 未压缩的 TP/PP 都在内）
-    nb, nm = b.get("nccl_total_bytes") if b else None, m.get("nccl_total_bytes") if m else None
-    if nb and nm:
-        out.append(f"通信量 端到端 NCCL payload: baseline={_fmt_gb(nb / 1e9)}GB  "
-                   f"mixed={_fmt_gb(nm / 1e9)}GB  "
-                   f"降低={_fmt_gb((nb - nm) / 1e9)}GB ({nb / nm:.2f}x)")
-    # 实时口径：DP-PP 重叠率 / 压缩比（只有开 polar 的 mode 才测得到）
+    # 跨机通信量/压缩量不在这里输出：端到端 NCCL payload 混着单机 TP/PP 流量，
+    # 比值没有意义；真正该看的是下面 [rt-metric] 的 DP 口径。
+    # 实时口径：DP-PP 重叠率 / 压缩比。baseline 的 DP 同步是串行做的，也应该
+    # 测得到（正常就是 0%）；测不到只可能是指标打印没走到。
     ov_b, ov_m = (_rt_mean(b, "rt_overlap_mean") if b else None), \
                  (_rt_mean(m, "rt_overlap_mean") if m else None)
     if ov_m is not None:
         out.append(f"重叠率 DP-PP（实时均值）: baseline={_fmt_pct(ov_b)}  mixed={_fmt_pct(ov_m)}")
     elif b and m:
-        out.append("重叠率 DP-PP: 实时口径未测到（baseline 不开 polar），无 trace 可参考")
+        out.append("重叠率 DP-PP: 实时口径未测到（检查两机日志里有没有 [rt-metric]），无 trace 可参考")
     red = _rt_mean(m, "rt_comm_reduction_mean") if m else None
     if red is not None:
         out.append(f"压缩比（实时均值）: mixed {red:.2f}x   "
