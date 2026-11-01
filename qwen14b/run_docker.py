@@ -15,10 +15,10 @@
   1. 在 run 目录下给两台机器各生成一份训练脚本
      `<run>/scripts/node{0,1}_<mode>.sh`（自包含：环境、METHOD_ARGS、torchrun 全在里面）
   2. 先起 node1（后台，输出落 node1.ssh.log），warmup 后起 node0（实时回显 + 落盘）
-  3. 等两边退出，收集 train.log / step_csv / profiler trace / [rt-metric] / NCCL 日志
+  3. 等两边退出，收集 train.log / step_csv / [rt-metric] / NCCL 日志
+     （trace 一律不查：Corex 上 profiler 跑不出 trace，分析只按 step_csv 口径）
   4. 全部跑完自动分析：
-     * trace 口径：每步耗时、GPU busy、DP/PP 标注、DP∩PP 重叠估计、kernel 分类、
-       通信 vs 计算；
+     * 步时口径：step_csv 里最后一级 stage 的逐步耗时；
      * 实时口径：每步 `[rt-metric]` 的 DP-PP 重叠率、pp_ms/dp_ms、通信
        dense/compressed/saved、压缩比（只有开 polar 的 mode 有）；
      * 通信量：`logs/nccl_*.log` 里 NCCL 自报的集合通信 payload 字节，两节点合计
@@ -26,8 +26,10 @@
      结果同时打到终端和 `<run>/analysis.log`、`<run>/metrics.log`、`<run>/summary.md`。
      baseline vs mixed 的对比里包含步时/吞吐、端到端通信量与降低倍数、重叠率、压缩比。
 
-profiler：每个 mode 跑 10 iter，只录第 8、9 iter
-（`--profiler-wait-steps 7 --profiler-warmup-steps 0 --profiler-active-steps 2`）。
+profiler：**无条件关闭**（生成的脚本固定 `--disable-profiler true`）。这版 Corex
+栈上 CUPTI 一采集，设备侧 kernel 就不再完成（2026-11-01 两轮复现：进 profiler 后
+8 秒整机停摆，32 rank 全停在 autograd/forward，无 XID、无 trace 产出），所以
+`--enable-profiler` 已废弃、不再生效。重叠率等指标走 step_csv 与 [rt-metric] 口径。
 不做 tc 限速。
 
 中途退出（Ctrl-C / 异常）会像 generate_and_run.py 那样把两台机器上的训练进程都清掉：
@@ -35,10 +37,11 @@ profiler：每个 mode 跑 10 iter，只录第 8、9 iter
 8 s 后仍在的再 SIGKILL。注意 Corex 上打断在途 NCCL 有 XID 24 风险，这是你要的行为。
 
 用法：
-    python3 run_docker.py                      # mixed 先跑、再 baseline，各 10 iter
+    python3 run_docker.py                      # mixed 先跑、再 baseline，各 5 iter，不开 profiler
     python3 run_docker.py --only-baseline      # 只跑 baseline，不跑 mixed
     python3 run_docker.py --modes mixed        # 只跑 mixed
-    python3 run_docker.py --max-steps 3        # 冒烟（此时 profile 不到 8/9 iter）
+    python3 run_docker.py --max-steps 10       # 每个 mode 跑 10 iter
+    python3 run_docker.py --max-steps 3        # 冒烟
     python3 run_docker.py --dry-run            # 只打印生成的脚本，什么都不启动
     python3 run_docker.py --preflight-only     # 只检查两台机器/容器/ssh/卡占用/卡健康
     python3 run_docker.py --skip-card-check    # 卡检查有历史日志噪音时临时跳过
@@ -136,25 +139,50 @@ export PATH=/usr/local/corex/bin:/usr/local/corex/lib64/python3/dist-packages/bi
 export LD_LIBRARY_PATH="$COREX_PATH/lib64:/usr/local/openmpi/lib:/usr/local/lib"
 export PYTHONPATH=/usr/local/corex/lib64/python3/dist-packages
 
-# ---- 通信（其余一律 NCCL 默认值）----
+# ---- 通信（与 cloud/run_xnode.sh、成功 run 的 PRE_RUN 一致）----
+export NCCL_IB_DISABLE=1
 export NCCL_SOCKET_IFNAME=@@ifname@@
+export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
 export NCCL_SOCKET_RETRY_CNT="${NCCL_SOCKET_RETRY_CNT:-600}"
 export NCCL_SOCKET_RETRY_SLEEP_MSEC="${NCCL_SOCKET_RETRY_SLEEP_MSEC:-1000}"
 
 # ---- 数据 ----
 unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY NO_PROXY no_proxy
 export HF_ENDPOINT=https://hf-mirror.com
+export HF_HUB_ETAG_TIMEOUT="${HF_HUB_ETAG_TIMEOUT:-15}"
+export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-30}"
 
-# ---- 输出 ----
+# ---- 输出 / 诊断 ----
 export PYTHONUNBUFFERED=1
+export PYTHONFAULTHANDLER=1
+export TORCH_SHOW_CPP_STACKTRACES=1
+export TORCH_CPP_LOG_LEVEL="${TORCH_CPP_LOG_LEVEL:-WARNING}"
+export KINETO_LOG_LEVEL="${KINETO_LOG_LEVEL:-5}"
+export TORCH_DISABLE_ADDR2LINE=1
+export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-off}"
+# torch 的 NCCL watchdog 会 abort 在途通信（Corex 上就是 XID 24 的路径），保持关闭。
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-0}"
+export TORCH_NCCL_ENABLE_MONITORING="${TORCH_NCCL_ENABLE_MONITORING:-0}"
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
+export TORCH_FR_BUFFER_SIZE=1048576
+# 通信超时基线；卡住时由外部 kill -9 处理，torch 自己不 abort。跨机首步慢，放宽到 600 s。
+export UDTCA_COMM_WATCHDOG_S="${UDTCA_COMM_WATCHDOG_S:-600}"
+export UDTCA_HTTP_READ_TIMEOUT_S="${UDTCA_HTTP_READ_TIMEOUT_S:-30}"
+export UDTCA_DATASET_RETRIES="${UDTCA_DATASET_RETRIES:-3}"
+export UDTCA_DATASET_STALL_S="${UDTCA_DATASET_STALL_S:-120}"
+# 梯度体检：默认 sanitize（坏 grad 就地清零并打 [gradguard] 行）；LOG_OK=1 让
+# 每步再打一行 all_finite，跑完直接 grep 就能确认有没有 NaN/Inf 梯度。
+export UDTCA_GRADGUARD="${UDTCA_GRADGUARD:-sanitize}"
+export UDTCA_GRADGUARD_LOG_OK="${UDTCA_GRADGUARD_LOG_OK:-1}"
 
 # 低比特 DP 同步严格串行（同 case_common：多 bucket 同时在飞会让两个 DP rank 的
 # p2p 投递顺序分叉，偶发卡死）。
 export POLAR_EF_LOWMEM_SERIAL_BUCKETS="${POLAR_EF_LOWMEM_SERIAL_BUCKETS:-1}"
 
-# ---- NCCL 集合通信日志（同 orchestrator._nccl_debug_env）----
+# ---- NCCL 集合通信日志（同 orchestrator._nccl_debug_env，subsys 对齐成功 run）----
 export NCCL_DEBUG=INFO
-export NCCL_DEBUG_SUBSYS=COLL
+export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_DEBUG_FILE="$CASE_DIR/logs/nccl_%h_%p.log"
 
 cat > "$CASE_DIR/PRE_RUN.md" <<PRE
@@ -162,7 +190,9 @@ cat > "$CASE_DIR/PRE_RUN.md" <<PRE
 - mode=@@mode@@ node_rank=@@rank@@/2 master=@@master_addr@@:@@master_port@@
 - GPUs=@@gpus@@ PP=@@pp@@ TP=@@tp@@
 - steps=@@max_steps@@ micro_batches=@@micro_batches@@ seq_len=@@seq_len@@ seed=@@seed@@
-- profiler: disable=false wait=@@prof_wait@@ warmup=0 active=@@prof_active@@ repeat=1
+- profiler: disable=@@prof_disable@@ wait=@@prof_wait@@ warmup=@@prof_warmup@@ active=@@prof_active@@ repeat=1
+- nccl: debug=$NCCL_DEBUG subsys=$NCCL_DEBUG_SUBSYS ib_disable=$NCCL_IB_DISABLE ifname=$NCCL_SOCKET_IFNAME p2p_disable=$NCCL_P2P_DISABLE
+- torch: cpp_log=$TORCH_CPP_LOG_LEVEL dist_debug=$TORCH_DISTRIBUTED_DEBUG faulthandler=$PYTHONFAULTHANDLER
 - generated by run_docker.py
 PRE
 
@@ -196,9 +226,9 @@ torchrun \
   --run-label @@run_label@@ \
   @@method_args@@ \
   --num-workers 0 \
-  --disable-profiler false \
+  --disable-profiler @@prof_disable@@ \
   --profiler-wait-steps @@prof_wait@@ \
-  --profiler-warmup-steps 0 \
+  --profiler-warmup-steps @@prof_warmup@@ \
   --profiler-active-steps @@prof_active@@ \
   --profiler-repeat 1 \
   --debug-nan-steps 2 \
@@ -212,8 +242,14 @@ exit "$RC"
 
 
 def build_script(mode, rank, args, case_dir, ts):
-    prof_active = 2
-    prof_wait = max(int(args.max_steps) - (prof_active + 1), 0)
+    # profiler 在这版 Corex 栈上**不可用**：一旦 CUPTI 开始采集，设备侧的 kernel
+    # 就不再完成（2026-11-01 两次复现：8 秒内整机停摆，32 个 rank 全停在
+    # autograd 引擎/forward 里，无 XID、无 trace 产出）。这里无条件关掉，
+    # --enable-profiler 只保留作兼容，不再起作用。
+    prof_disable = "true"
+    prof_wait = 0
+    prof_warmup = 0
+    prof_active = 1  # entry 仍校验 active > 0，占位值
     values = {
         "mode": mode,
         "rank": rank,
@@ -234,7 +270,9 @@ def build_script(mode, rank, args, case_dir, ts):
         "seed": args.seed,
         "method_args": " \\\n  ".join(METHOD_ARGS[mode]),
         "run_label": RUN_LABELS[mode],
+        "prof_disable": prof_disable,
         "prof_wait": prof_wait,
+        "prof_warmup": prof_warmup,
         "prof_active": prof_active,
     }
     body = SCRIPT_TEMPLATE
@@ -741,8 +779,9 @@ def _rt_summary(rt):
 
 # ---------------------------------------------------------------- NCCL 集合通信字节
 #
-# 口径与 udtca-config/utils/parse_nccl_bytes.py 一致：NCCL_DEBUG_SUBSYS=COLL 的每行
-# 都带 count 和 datatype，乘起来就是「交给网络的那块 buffer」的字节数。把该 case
+# 口径与 udtca-config/utils/parse_nccl_bytes.py 一致：NCCL 的集合通信行（COLL 子
+# 系统）都带 count 和 datatype，乘起来就是「交给网络的那块 buffer」的字节数。这里
+# 用 SUBSYS=ALL 是为了诊断信息齐全，只匹配 "<Op> ... count ... datatype" 行，不受影响。把该 case
 # 所有 rank 加起来 = 这一跑端到端真正通信的量（压缩过的 DP + 未压缩的 TP/PP 都在内）。
 # 比读网卡计数器干净：k8s 节点上还有别的租户流量。
 #
@@ -831,19 +870,6 @@ def parse_step_csv(host, container, case_dir):
     times = [per_step[s] for s in sorted(per_step)]
     return {"num_steps": len(times), "avg_step_s": sum(times) / len(times),
             "total_step_s": sum(times), "per_step": times}
-
-
-def find_traces(host, container, repo, since_epoch):
-    inner = (f"find {repo}/log -name '*.pt.trace.json' -newermt @{int(since_epoch)} "
-             f"-printf '%s %p\\n' 2>/dev/null | sort -k2")
-    out = subprocess.run(_docker(host, container, inner),
-                         capture_output=True, text=True, timeout=180)
-    rows = []
-    for line in out.stdout.splitlines():
-        size, _, path = line.partition(" ")
-        if path:
-            rows.append({"path": path, "mb": round(int(size) / 1e6, 1)})
-    return rows
 
 
 # ---------------------------------------------------------------- trace 分析
@@ -1000,15 +1026,15 @@ def analysis_report(rows, args):
     lines = []
     add = lines.append
     add("=" * 78)
-    add("训练性能分析（trace 口径：ProfilerStep 窗口内的 GPU kernel 累加）")
+    add("训练性能分析（step_csv 口径：不读 trace）")
     add("=" * 78)
     for r in rows:
         add(f"\n## {r['mode']}   两端 EXIT_CODE: node0={r['exit0']} node1={r['exit1']}")
+        add("  trace: 不采集也不分析（Corex 上 profiler 出不了 trace）")
         agg_all = []
         for rank in (0, 1):
             traces = r["traces_by_node"][rank]
             if not traces:
-                add(f"  node{rank} {NODES[rank]['name']}: 没有找到 trace")
                 continue
             print(f"  [分析] {r['mode']} node{rank} {NODES[rank]['name']}: "
                   f"{len(traces)} 个 trace, "
@@ -1104,7 +1130,7 @@ def metrics_report(rows, args):
         total = r.get("nccl_total_bytes")
         if total is None:
             why = (nc0.get("error") or nc1.get("error")
-                   or "没有 logs/nccl*.log（NCCL_DEBUG_SUBSYS=COLL 未生效或训练没起来）")
+                   or "没有 logs/nccl*.log（NCCL_DEBUG 未生效或训练没起来）")
             add(f"  端到端集合通信量: 未测得（{why}）")
         else:
             add(f"  端到端集合通信量（NCCL COLL payload，两节点合计）: "
@@ -1214,8 +1240,8 @@ def collect(rec, args):
     if step.get("total_step_s"):
         thr = step["num_steps"] * dp_world * args.micro_batches * args.seq_len / step["total_step_s"]
 
-    traces = {0: find_traces(NODES[0]["host"], args.container, args.repo, rec["started"]),
-              1: find_traces(NODES[1]["host"], args.container, args.repo, rec["started"])}
+    # trace 一律不找：Corex 上 profiler 跑不出 trace，扫 log 目录只会拿到别轮的旧文件。
+    traces = {0: [], 1: []}
 
     # 实时指标（每步一行，只有开 polar 的 mode 有）——node0/node1 各一份
     rt0 = _rt_summary(parse_rt_metrics(
@@ -1308,8 +1334,7 @@ def compare(rows):
     if ov_m is not None:
         out.append(f"重叠率 DP-PP（实时均值）: baseline={_fmt_pct(ov_b)}  mixed={_fmt_pct(ov_m)}")
     elif b and m:
-        out.append("重叠率 DP-PP: 实时口径未测到（baseline 不开 polar），"
-                   "dense 侧参考上面 trace 标注的 DP∩PP 估计")
+        out.append("重叠率 DP-PP: 实时口径未测到（baseline 不开 polar），无 trace 可参考")
     red = _rt_mean(m, "rt_comm_reduction_mean") if m else None
     if red is not None:
         out.append(f"压缩比（实时均值）: mixed {red:.2f}x   "
@@ -1328,7 +1353,7 @@ def compare(rows):
 
 def make_arg_parser():
     p = argparse.ArgumentParser(
-        description="跨机 Qwen14B：mixed/baseline 各 10 iter + profiler 8/9 iter + 自动分析",
+        description="跨机 Qwen14B：mixed/baseline 各 5 iter（默认不开 profiler）+ 自动分析",
         epilog="必须在 powerone1 的宿主机上运行（容器里没有 docker）。")
     p.add_argument("--modes", default=None,
                    help="逗号分隔，可选 baseline|polar_dense|bitscom|mixed（按顺序跑；"
@@ -1341,19 +1366,24 @@ def make_arg_parser():
     p.add_argument("--ssh-opts", default="",
                    help='ssh 参数（给了就整体替换默认的 "-o BatchMode=yes -o ConnectTimeout=10"），'
                         '如 "-p 7122 -i /root/.ssh/id_rsa"')
-    p.add_argument("--max-steps", type=int, default=10)
+    p.add_argument("--max-steps", type=int, default=5)
     p.add_argument("--micro-batches", type=int, default=16)
     p.add_argument("--seq-len", type=int, default=256)
     p.add_argument("--gpus", type=int, default=16, help="每台机器的卡数")
     p.add_argument("--pp", type=int, default=8)
     p.add_argument("--tp", type=int, default=2)
     p.add_argument("--seed", type=int, default=1234)
-    p.add_argument("--master-port", type=int, default=29630)
+    # 29630 在 powerone1 上会被 kube-apiserver 的临时端口占用，默认换成两机都空的端口。
+    p.add_argument("--master-port", type=int, default=29693)
+    p.add_argument("--enable-profiler", action="store_true",
+                   help="已废弃：profiler 在 Corex 上会卡死整机，脚本无条件关闭，本参数不起作用")
+    p.add_argument("--profiler-active-steps", type=int, default=2,
+                   help="已废弃（profiler 强制关闭）")
     p.add_argument("--dataset-config", default="sample-10BT")
     p.add_argument("--warmup-s", type=int, default=25, help="node1 起来后等多少秒再起 node0")
     p.add_argument("--timeout-s", type=int, default=None,
                    help="单节点最长等待（默认不限；到点只停止等待，不杀进程）")
-    p.add_argument("--no-analyze", action="store_true", help="跑完不做 trace 分析")
+    p.add_argument("--no-analyze", action="store_true", help="跑完不做分析")
     p.add_argument("--skip-preflight", action="store_true", help="跳过启动前检查")
     p.add_argument("--skip-card-check", action="store_true",
                    help="跳过卡占用 / page fault / vmid 检查（默认不跳过）")
@@ -1388,7 +1418,10 @@ def main():
     print("=" * 78)
     print(f"跨机训练  modes={modes}  steps={args.max_steps}  "
           f"GPUS={args.gpus}/节点 DP={2 * args.gpus // (args.pp * args.tp)} "
-          f"PP={args.pp} TP={args.tp}  profiler=第 8/9 iter")
+          f"PP={args.pp} TP={args.tp}  "
+          f"profiler=关闭（强制）")
+    if args.enable_profiler:
+        print("提示：--enable-profiler 已废弃，profiler 在 Corex 上会卡死整机，本次仍按关闭执行")
     print(f"  node0 {NODES[0]['name']}(本机) {NODES[0]['ip']}   "
           f"node1 {NODES[1]['name']} {NODES[1]['ip']}   容器={args.container}")
     print(f"  master {NODES[0]['ip']}:{args.master_port}    run_dir {run_dir}")

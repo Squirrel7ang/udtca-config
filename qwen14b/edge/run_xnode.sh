@@ -181,6 +181,7 @@ torchrun \
   "${METHOD_ARGS[@]}" \
   --num-workers 0 \
   --disable-profiler "$DISABLE_PROFILER" \
+  --profiler-start-step "${PROFILER_START_STEP:-1}" \
   --profiler-wait-steps "${PROFILER_WAIT_STEPS:-0}" \
   --profiler-warmup-steps "${PROFILER_WARMUP_STEPS:-0}" \
   --profiler-active-steps "${PROFILER_ACTIVE_STEPS:-$MAX_STEPS}" \
