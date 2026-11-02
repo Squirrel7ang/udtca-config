@@ -14,6 +14,8 @@
 | `run.py` | 固定 4 case 一键跑 + 汇总（写 `run_log/run_<ts>/summary.*`） | 同上 |
 | `_run_baseline.py` | 内部脚本：只跑 baseline 条目 | 同上 |
 | `run_docker.py` | **跨机容器版启动器**（宿主机上跑）：生成 node 脚本 → 起训 → 分析 | 入口路径、模型名、`--master-port 29694`、清理匹配 `run_qwen3b*` |
+| `third-test/run_docker.py` | 与 `qwen14b/third-test/run_docker.py` 逻辑相同的跨机启动器（默认 20 步，带线上流量/实时指标汇总） | 同上（模型名、入口路径、master 端口） |
+| `third-test/run_api.py` | 拉起 `third-test/run_docker.py` + 实时指标 API（接口同 `metrics_api.py`） | 仅路径/命名 |
 | `run_docker_single_node.sh` | 单机容器版启动器 | 入口路径、`MASTER_PORT 29730` |
 | `cloud/` `edge/` | 云侧(powerone1,node0) / 边侧(powerone2,node1) 的单机与跨机脚本 | 入口路径、端口 +100 |
 | `dp_test.py` `dp_test_bigpair.py` `nccl_xnode_test.py` | 与模型无关的通信自检 | 仅路径/端口 |
