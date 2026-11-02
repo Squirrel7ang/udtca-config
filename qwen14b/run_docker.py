@@ -49,6 +49,7 @@ profiler：**无条件关闭**（生成的脚本固定 `--disable-profiler true`
     python3 run_docker.py --max-steps 10       # 每个 mode 跑 10 iter
     python3 run_docker.py --max-steps 3        # 冒烟
     python3 run_docker.py --dry-run            # 只打印生成的脚本，什么都不启动
+    python3 run_docker.py --save-weights --max-steps 5   # 跑完存权重（默认 <repo>/checkpoints/xnode）
     python3 run_docker.py --preflight-only     # 只检查两台机器/容器/ssh/卡占用/卡健康
     python3 run_docker.py --skip-card-check    # 卡检查有历史日志噪音时临时跳过
 """
@@ -240,13 +241,21 @@ torchrun \
   --profiler-active-steps @@prof_active@@ \
   --profiler-repeat 1 \
   --debug-nan-steps 2 \
-  --save-dir "$CASE_DIR/ckpt" \
+  --save-dir @@save_dir@@ \
   --step-log-dir "$CASE_DIR/step_csv" \
   2>&1 | "${TEE[@]}"
 RC=${PIPESTATUS[0]}
 echo "EXIT_CODE=$RC" | tee -a "$CASE_DIR/EXIT_CODE" "$CASE_DIR/train.log" "$RUN_LOG"
 exit "$RC"
 """
+
+
+def _mode_args(mode, args):
+    """mode 自带的训练参数；--save-weights 时追加权重保存开关和目录。"""
+    argv = list(METHOD_ARGS[mode])
+    if getattr(args, "save_weights", False):
+        argv += ["--save-weights"]
+    return argv
 
 
 def build_script(mode, rank, args, case_dir, ts):
@@ -276,7 +285,10 @@ def build_script(mode, rank, args, case_dir, ts):
         "seq_len": args.seq_len,
         "dataset_config": args.dataset_config,
         "seed": args.seed,
-        "method_args": " \\\n  ".join(METHOD_ARGS[mode]),
+        "method_args": " \\\n  ".join(_mode_args(mode, args)),
+        # 不存权重时沿用 $CASE_DIR/ckpt（保持原行为），存权重时用 --save-dir
+        "save_dir": (shlex.quote(args.save_dir) if getattr(args, "save_weights", False)
+                     else '"$CASE_DIR/ckpt"'),
         "run_label": RUN_LABELS[mode],
         "prof_disable": prof_disable,
         "prof_wait": prof_wait,
@@ -1521,6 +1533,13 @@ def make_arg_parser():
                    help="已废弃：profiler 在 Corex 上会卡死整机，脚本无条件关闭，本参数不起作用")
     p.add_argument("--profiler-active-steps", type=int, default=2,
                    help="已废弃（profiler 强制关闭）")
+    p.add_argument("--save-weights", action="store_true",
+                   help="训练结束后保存模型权重（透传 entry 的 --save-weights）："
+                        "每个 (pp_stage, tp_rank) 一个分片文件，只由 dp_rank 0 写，"
+                        "不额外占显存")
+    p.add_argument("--save-dir", default=None,
+                   help="权重保存根目录（容器内路径），须配合 --save-weights；"
+                        "默认 <repo>/checkpoints/xnode")
     p.add_argument("--dataset-config", default="sample-10BT")
     p.add_argument("--net-if0", default=None,
                    help=f"node0 跨机网卡名（默认 {NODES[0]['ifname']}，即 NCCL_SOCKET_IFNAME）")
@@ -1579,6 +1598,8 @@ def _install_stdout_log(run_dir):
 
 def main():
     args = make_arg_parser().parse_args()
+    if args.save_weights and not args.save_dir:
+        args.save_dir = f"{args.repo}/checkpoints/xnode"
     args._ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     SSH["target"] = args.ssh_target
     if args.ssh_opts.strip():

@@ -98,7 +98,14 @@ cd udtca-config/qwen14b
 python run_docker.py --mode baseline                 # 2×8 卡，DP=4 PP=4 TP=1
 python run_docker.py --mode polar --max-steps 3
 python run_docker.py --dry-run                       # 只打印两边命令
+python run_docker.py --modes polar --max-steps 5 --save-weights \
+    --save-dir /data/tangruijing/udtca/checkpoints/xnode   # 跑完把权重存盘
 ```
+
+`--save-weights` 只在训练结束后写一次，每个 `(pp_stage, tp_rank)` 一个分片文件，
+路径 `<save-dir>/<run-label>/ppXX_tpYY/step_XXXXXX.pt`；只由 `dp_rank 0` 写，
+GPU 上不额外驻留副本（逐个参数拷到 CPU），CPU 峰值约等于本 stage 的权重。
+入口 `run_qwen14b_polar_dp_pp_tp.py` 里对应的是同名参数。
 
 它做的事：**卡检查** → 远端建 case 目录 → ssh 起 node1（后台，日志落盘）→ 等 20s →
 ssh 起 node0（实时回显）→ 拉两边的 `train.log`/`EXIT_CODE` → 打汇总。
