@@ -107,6 +107,9 @@ python run_docker.py --modes polar --max-steps 5 --save-weights \
 GPU 上不额外驻留副本（逐个参数拷到 CPU），CPU 峰值约等于本 stage 的权重。
 入口 `run_qwen14b_polar_dp_pp_tp.py` 里对应的是同名参数。
 
+汇总里有两套加速比：**端到端**（`wall_s`：拉起 node1 → 两机退出，含模型构建 /
+NCCL 建连 / 收尾）和 **step 口径**（`avg_step_s`，稳态单步），两者分开列。
+
 它做的事：**卡检查** → 远端建 case 目录 → ssh 起 node1（后台，日志落盘）→ 等 20s →
 ssh 起 node0（实时回显）→ 拉两边的 `train.log`/`EXIT_CODE` → 打汇总。
 

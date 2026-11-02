@@ -1133,6 +1133,12 @@ def metrics_report(rows, args):
 
     for r in rows:
         add(f"\n## {r['mode']}   EXIT_CODE node0={r['exit0']} node1={r['exit1']}")
+        wall, step_total = r.get("elapsed_s"), r.get("total_step_s")
+        if wall is not None:
+            overhead = (wall - step_total) if step_total is not None else None
+            add(f"  端到端耗时（拉起 node1 → 两机退出）: {_fmt(wall, 1)} s"
+                f"；step 合计 {_fmt(step_total, 1)} s"
+                f"；启动/建连/收尾 {_fmt(overhead, 1)} s")
         for rank in (0, 1):
             rt = r["rt"][rank]
             name = NODES[rank]["name"]
@@ -1328,7 +1334,9 @@ def run_mode(mode, args, run_dir):
         print("    node0 不启动，跳过本 mode 剩下的内容。")
         for p in net_procs.values():
             stop_net_sampler(p)
+        elapsed_s = time.time() - started
         return {"mode": mode, "case_dir": str(mode_dir), "started": started,
+                "elapsed_s": round(elapsed_s, 1),
                 "exit0": "not-started", "exit1": str(proc1.returncode),
                 "node0": str(mode_dir / "node0"), "node1": str(mode_dir / "node1"),
                 "nets": {rank: parse_net_samples(mode_dir / f"net_node{rank}.csv")
@@ -1353,6 +1361,9 @@ def run_mode(mode, args, run_dir):
     _STATE["proc0"] = _STATE["proc1"] = None
     for p in net_procs.values():
         stop_net_sampler(p)
+    # 端到端墙钟：脚本生成完 → 起 node1 → warmup → node0 跑完 → 两机进程退出。
+    # 不含生成脚本/卡检查；含模型构建、NCCL 建连、收尾。
+    elapsed_s = time.time() - started
 
     for p in (proc0, proc1):
         fh = getattr(p, "_log_fh", None)
@@ -1367,6 +1378,7 @@ def run_mode(mode, args, run_dir):
         "mode": mode,
         "case_dir": str(mode_dir),
         "started": started,
+        "elapsed_s": round(elapsed_s, 1),
         "exit0": exit0.replace("EXIT_CODE=", "").strip() or str(rc0),
         "exit1": exit1.replace("EXIT_CODE=", "").strip() or str(rc1),
         "node0": str(mode_dir / "node0"),
@@ -1443,7 +1455,7 @@ def _rt_mean(r, key):
 
 def summary_table(rows):
     hdr = (f"{'mode':10} {'exit0':>9} {'exit1':>9} {'loss0':>8} {'loss1':>8} "
-           f"{'steps':>5} {'avg_step_s':>10} {'tok/s':>9} {'traces':>6} {'GB':>7} "
+           f"{'steps':>5} {'avg_step_s':>10} {'wall_s':>8} {'tok/s':>9} {'traces':>6} {'GB':>7} "
            f"{'overlap':>8} {'netGB':>8} {'net/st':>8} {'压缩比':>8}")
     lines = [hdr, "-" * len(hdr)]
     for r in rows:
@@ -1453,6 +1465,7 @@ def summary_table(rows):
             f"{r['mode']:10} {str(r['exit0']):>9} {str(r['exit1']):>9} "
             f"{_fmt(r['final_loss_node0'], 4):>8} {_fmt(r['final_loss_node1'], 4):>8} "
             f"{str(r['num_steps'] or '-'):>5} {_fmt(r['avg_step_s']):>10} "
+            f"{_fmt(r.get('elapsed_s'), 1):>8} "
             f"{_fmt(r['throughput_tok_s'], 1):>9} "
             f"{len(r['traces']):>6} {_fmt(r['trace_mb'] / 1024):>7} "
             f"{_fmt_pct(_rt_mean(r, 'rt_overlap_mean')):>8} "
@@ -1467,6 +1480,10 @@ def compare(rows):
     by = {r["mode"]: r for r in rows}
     b, m = by.get("baseline"), by.get("polar")
     out = []
+    if b and m and b.get("elapsed_s") and m.get("elapsed_s"):
+        out.append(f"端到端 baseline={b['elapsed_s']:.1f}s  polar={m['elapsed_s']:.1f}s  "
+                   f"加速={b['elapsed_s'] / m['elapsed_s']:.2f}x"
+                   "（拉起→两机退出，含模型构建/NCCL 建连/收尾）")
     if b and m and b.get("avg_step_s") and m.get("avg_step_s"):
         out.append(f"步时   baseline={b['avg_step_s']:.2f}s  polar={m['avg_step_s']:.2f}s  "
                    f"加速={b['avg_step_s'] / m['avg_step_s']:.2f}x")
