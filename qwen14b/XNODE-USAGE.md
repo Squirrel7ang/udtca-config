@@ -16,11 +16,11 @@
 ```bash
 # 1) 边侧先起，它会等 master（边侧机器容器内）
 cd /data/tangruijing/udtca/udtca-config/qwen14b
-MODE=mixed bash edge/run_xnode.sh
+MODE=polar bash edge/run_xnode.sh
 
 # 2) 云侧再起（云侧机器容器内）
 cd /data/tangruijing/udtca/udtca-config/qwen14b
-MODE=mixed bash cloud/run_xnode.sh
+MODE=polar bash cloud/run_xnode.sh
 ```
 
 两边 `MODE` 必须一致，其余可覆盖项（`MAX_STEPS`、`MICRO_BATCHES`、`SEQ_LEN`、
@@ -36,13 +36,13 @@ MODE=mixed bash cloud/run_xnode.sh
 | `baseline` | 纯 DDP（DP 走 dense all-reduce） |
 | `polar_dense` | Polar EF 低内存桶，dense all-reduce |
 | `bitscom` | 低比特压缩，不用 polar |
-| `mixed` | Polar + bitscom（默认关注的对象） |
+| `polar` | Polar + bitscom（默认关注的对象） |
 
 ## 常用覆盖
 
 ```bash
-MODE=mixed MAX_STEPS=1 bash edge/run_xnode.sh          # 冒烟
-MODE=mixed DISABLE_PROFILER=true bash edge/run_xnode.sh # 不抓 trace
+MODE=polar MAX_STEPS=1 bash edge/run_xnode.sh          # 冒烟
+MODE=polar DISABLE_PROFILER=true bash edge/run_xnode.sh # 不抓 trace
 MODE=baseline MASTER_PORT=29631 ...                     # 端口冲突时换
 ```
 
@@ -75,4 +75,4 @@ profiler trace 落在 `<repo>/log/<run-label>/.../tb_trace/*.pt.trace.json`。
 - 中途 Ctrl-C 会打断在途 NCCL，Corex 上有 XID 24（MMU 挂死）风险；要停就两边一起停，
   停完用 `ixsmi` 确认卡状态。
 - 宿主机侧还有 `qwen14b/run_docker.py`（在 powerone1 宿主机跑，自动起两台容器、
-  跑 mixed/baseline 并做 trace 分析），见该文件头部注释。
+  跑 polar/baseline 并做 trace 分析），见该文件头部注释。

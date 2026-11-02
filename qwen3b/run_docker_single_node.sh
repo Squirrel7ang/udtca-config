@@ -11,7 +11,7 @@
 #   baseline     POLAR off, 不量化
 #   polar_dense  POLAR on,  不量化      （与 baseline 只差 POLAR）
 #   bitscom      POLAR off, 量化        （与 baseline 只差量化）
-#   mixed        POLAR on,  量化        （与 polar_dense 只差量化）
+#   polar        POLAR on,  量化        （与 polar_dense 只差量化）
 #
 #   产物在 $CASE_DIR：train.log、logs/nccl.*.log、PRE_RUN.md、EXIT_CODE。
 set -uo pipefail
@@ -62,14 +62,14 @@ case "$MODE" in
                  --using-polar false --polar-hook none --comm-timing 0
                  --method bitscom --bitwidth 2)
     ;;
-  mixed)
+  polar)
     RUN_LABEL=polar_bitscom_single
     METHOD_ARGS=(--baseline-mode manual
                  --using-polar true --polar-hook ef_lowmem --comm-timing 8
                  --polar-bucket-numel 64000000 --polar-max-inflight-buckets 1
                  --method bitscom --bitwidth 2)
     ;;
-  *) echo "ERROR: 未知 MODE=$MODE（baseline|polar_dense|bitscom|mixed）" >&2; exit 2 ;;
+  *) echo "ERROR: 未知 MODE=$MODE（baseline|polar_dense|bitscom|polar）" >&2; exit 2 ;;
 esac
 
 TS="$(date +%Y%m%d_%H%M%S)"

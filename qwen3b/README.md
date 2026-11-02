@@ -68,8 +68,8 @@ python udtca-config/qwen3b/run.py --max-steps 3 --no-tc   # 固定 4 case + 汇�
 
 ```bash
 cd /data1/tangruijing/udtca/udtca-config/qwen3b
-python3 run_docker.py --modes mixed --max-steps 5            # 默认不开 profiler
-python3 run_docker.py --modes baseline,mixed --max-steps 5 --gpus 8 --pp 4 --tp 2
+python3 run_docker.py --modes polar --max-steps 5            # 默认不开 profiler
+python3 run_docker.py --modes baseline,polar --max-steps 5 --gpus 8 --pp 4 --tp 2
 python3 run_docker.py --dry-run                              # 只看生成的脚本
 ```
 

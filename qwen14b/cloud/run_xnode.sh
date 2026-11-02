@@ -2,7 +2,7 @@
 # 跨机 Qwen2.5-14B / 云侧 powerone1（node0）—— 容器内执行，自包含，不调用别的脚本。
 #
 #   bash cloud/run_xnode.sh
-#   MODE=mixed MAX_STEPS=1 bash cloud/run_xnode.sh
+#   MODE=polar MAX_STEPS=1 bash cloud/run_xnode.sh
 #
 # 先起边侧 edge/run_xnode.sh，再起本脚本（rendezvous 在 master 上等对端）。
 # 拓扑：两台各 16 卡（合计 32），PP=8 TP=2 → 每台就是一个完整的 PP×TP 副本，
@@ -60,14 +60,14 @@ case "$MODE" in
                  --using-polar false --polar-hook none --comm-timing 0
                  --method bitscom --bitwidth 2)
     ;;
-  mixed)
+  polar)
     RUN_LABEL=polar_bitscom_xnode
     METHOD_ARGS=(--baseline-mode manual
                  --using-polar true --polar-hook ef_lowmem --comm-timing 8
                  --polar-bucket-numel 64000000 --polar-max-inflight-buckets 1
                  --method bitscom --bitwidth 2)
     ;;
-  *) echo "ERROR: 未知 MODE=$MODE（baseline|polar_dense|bitscom|mixed）" >&2; exit 2 ;;
+  *) echo "ERROR: 未知 MODE=$MODE（baseline|polar_dense|bitscom|polar）" >&2; exit 2 ;;
 esac
 
 TS="$(date +%Y%m%d_%H%M%S)"

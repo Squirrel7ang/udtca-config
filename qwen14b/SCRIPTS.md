@@ -7,7 +7,7 @@
 | 单机主体 | `run_docker_single_node.sh` | 容器内实际启动 torchrun 的脚本 |
 | 跨机连通性 | `cloud/run_nccl_xnode.sh`、`edge/run_nccl_xnode.sh` + `nccl_xnode_test.py` | 两机各 1 卡，先测 NCCL 再测 bitscom |
 | 跨机训练（手动） | `cloud/run_xnode.sh`、`edge/run_xnode.sh` | 两台各 16 卡、PP=8 TP=2；各自容器内执行，见 `XNODE-USAGE.md` |
-| 跨机训练（一键） | `run_docker.py` | 在 powerone1 **宿主机**执行，自动起两机容器跑 mixed/baseline 并分析 trace |
+| 跨机训练（一键） | `run_docker.py` | 在 powerone1 **宿主机**执行，自动起两机容器跑 polar/baseline 并分析 trace |
 | 诊断 | `diag/` | 单机排障 |
 
 ## 1. 单机训练（容器内执行）
@@ -40,7 +40,7 @@ MODE=baseline bash edge/run_single_node_8gpu.sh     # 边侧 powerone2
 | `baseline`（默认） | off | off | `baseline_ddp_single` |
 | `polar_dense` | on | off | `polar_dense_single` |
 | `bitscom` | off | on | `bitscom_quant_single` |
-| `mixed` | on | on | `polar_bitscom_single` |
+| `polar` | on | on | `polar_bitscom_single` |
 
 低比特 DP 同步默认**严格串行**（`POLAR_EF_LOWMEM_SERIAL_BUCKETS=1`）。lowbit 的
 phase1/phase2/restore 共用同一个 comm，多个 bucket 同时在飞时两个 DP rank 的 p2p
@@ -57,7 +57,7 @@ phase1/phase2/restore 共用同一个 comm，多个 bucket 同时在飞时两个
 ```bash
 MAX_STEPS=3 MICRO_BATCHES=16 SEQ_LEN=256 MASTER_PORT=29630 \
 CASE_DIR=/path/to/case DATASET_CONFIG=sample-10BT \
-MODE=mixed bash cloud/run_single_node_8gpu.sh
+MODE=polar bash cloud/run_single_node_8gpu.sh
 ```
 
 - `UDTCA_COMM_WATCHDOG_S`：卡死自动回滚超时（默认 600s）。
@@ -93,7 +93,7 @@ bitscom 低比特 all_reduce（fp32 + bf16，跟 NCCL 全精度比相对误差�
 ```bash
 cd udtca-config/qwen14b
 python run_docker.py --mode baseline                 # 2×8 卡，DP=4 PP=4 TP=1
-python run_docker.py --mode mixed --max-steps 3
+python run_docker.py --mode polar --max-steps 3
 python run_docker.py --dry-run                       # 只打印两边命令
 ```
 
@@ -119,7 +119,7 @@ ssh 起 node0（实时回显）→ 拉两边的 `train.log`/`EXIT_CODE` → 打�
 | `logs/nccl*.log`（`NCCL_DEBUG_SUBSYS=COLL`） | 端到端集合通信 payload 字节（两节点合计、按算子） | 每个 mode 跑完 |
 
 产物：`<run>/summary.md`、`summary.json`、`analysis.log`（trace 分析）、
-`metrics.log`（实时指标 + 通信量），终端同时打印；baseline vs mixed 的对比包含
+`metrics.log`（实时指标 + 通信量），终端同时打印；baseline vs polar 的对比包含
 步时/吞吐、端到端通信量与降低倍数、重叠率、压缩比。
 
 ## 4. 诊断脚本（`diag/`）

@@ -163,7 +163,7 @@ qwen14b / qwen3b `micro-batches=32`、qwenvl8b `micro-batches=8`；`--log-interv
 | `qwen14b/start_metrics_api.py` | 起实时指标 API，`--with-training` 可同时拉起 `run.py` | `python .../qwen14b/start_metrics_api.py --port 8000 [--with-training]` |
 | `qwen14b/_run_baseline.py` | 内部脚本：只跑 `baseline=True` 的条目，共用同一套 case 编号 | 一般不用直接调用，`generate_and_run.py --only` 即可 |
 | `qwen3b/generate_and_run.py` | Qwen3B 主入口，行为同上（端口 29520） | `python .../qwen3b/generate_and_run.py [--only 1]` |
-| `qwen3b/run_docker.py` | Qwen3B 跨机容器版启动器，可调 `--gpus/--pp/--tp` 扫不同卡数 | `python3 .../qwen3b/run_docker.py --modes mixed --max-steps 5` |
+| `qwen3b/run_docker.py` | Qwen3B 跨机容器版启动器，可调 `--gpus/--pp/--tp` 扫不同卡数 | `python3 .../qwen3b/run_docker.py --modes polar --max-steps 5` |
 | `qwenvl8b/generate_and_run.py` | QwenVL8B 主入口，行为同上 | 同上 |
 | `qwenvl8b/_run_baseline.py` | QwenVL8B 内部脚本：只跑 baseline | 同上 |
 | `common/case_common.py` | 被上面 4 个 import。定义 `ExperimentSpec`、`SETUP_CMDS`（两节点环境对齐）、`ssh_execute`（base64 传远程脚本）、`check_gpus_free`、`allocate_case`、`write_launch_script` 等 | 不单独运行 |
