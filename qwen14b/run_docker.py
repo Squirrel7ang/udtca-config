@@ -22,7 +22,7 @@
      * 实时口径：每步 `[rt-metric]` 的 DP-PP 重叠率、pp_ms/dp_ms、通信
        dense/compressed/saved、压缩比（只有开 polar 的 mode 有）；
      * 线上流量：两机跨机网卡（NCCL_SOCKET_IFNAME）的 rx/tx 字节计数器，训练期间
-       1 Hz 采样。只有出网卡的 DP 同步计入，单机 TP/PP 不计；含协议头/重传。
+       每 10 s 采样一次。只有出网卡的 DP 同步计入，单机 TP/PP 不计；含协议头/重传。
      * 参考：`logs/nccl_*.log` 里 NCCL 自报的集合通信 payload（每 rank 逻辑字节，
        有 ring/tree 重复计数，只落 summary.json，不出现在对比里）。
      结果同时打到终端和 `<run>/analysis.log`、`<run>/metrics.log`、`<run>/summary.md`。
@@ -648,6 +648,10 @@ def cleanup_nodes(args, reason=""):
     if _STATE["cleaned"] or args is None:
         return
     _STATE["cleaned"] = True
+    # 自己起的网卡采样 shell/ssh 先收掉，避免中断后留着空转
+    for p in (_STATE.get("net_procs") or {}).values():
+        stop_net_sampler(p)
+    _STATE["net_procs"] = {}
     print(f"\n[cleanup] {reason or '退出'}：清理两台机器上的训练进程")
     print("          （先 SIGTERM，8s 后仍在的 SIGKILL；Corex 上打断在途 NCCL 有 XID 24 风险）")
     for rank in (0, 1):
@@ -1143,7 +1147,8 @@ def metrics_report(rows, args):
 
         nets = r.get("nets") or {}
         if any(nets.get(k) for k in (0, 1)):
-            add("  端到端线上流量（跨机网卡 rx/tx 计数器，1 Hz 采样；单机 TP/PP 不出网卡）:")
+            add(f"  端到端线上流量（跨机网卡 rx/tx 计数器，每 {NET_SAMPLE_INTERVAL_S} s 采样一次；"
+                "单机 TP/PP 不出网卡）:")
             total = 0
             for rank in (0, 1):
                 n = nets.get(rank)
@@ -1172,22 +1177,27 @@ def metrics_report(rows, args):
 # 重复计数，和 1 Gbps 链路上真正跑的字节差一个数量级。要看端到端流量就直接读两机
 # 跨机网卡的字节计数器：只含出网卡的流量（DP 同步），单机 TP/PP 不经过它；代价是
 # 含协议头/重传，也可能混进同一条链路上其他租户的流量。
-# 采样随 mode 一起起跑、一起停，1 Hz，原始样本存 mode_dir/net_node{rank}.csv。
+# 采样随 mode 一起起跑、一起停，10 s 一次（只是看总量，不需要秒级分辨率；
+# 计数器是单调累加的，间隔多长都不影响整段窗口的差值），原始样本存
+# mode_dir/net_node{rank}.csv。
 
 NET_IF = {}  # main() 里按命令行覆盖
+NET_SAMPLE_INTERVAL_S = 10
 
 NET_SAMPLE_LOOP = (
     "while :; do "
     "r=$(cat /sys/class/net/@@if@@/statistics/rx_bytes 2>/dev/null) || break; "
     "t=$(cat /sys/class/net/@@if@@/statistics/tx_bytes 2>/dev/null) || break; "
-    "echo \"$(date +%s.%N) $r $t\"; sleep 1; done"
+    "echo \"$(date +%s.%N) $r $t\"; sleep @@interval@@; done"
 )
 
 
 def start_net_sampler(rank, out_path):
     node = NODES[rank]
     ifname = NET_IF.get(rank) or node["ifname"]
-    argv = _on(node["host"], NET_SAMPLE_LOOP.replace("@@if@@", ifname))
+    loop = (NET_SAMPLE_LOOP.replace("@@if@@", ifname)
+            .replace("@@interval@@", str(NET_SAMPLE_INTERVAL_S)))
+    argv = _on(node["host"], loop)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(out_path, "w", encoding="utf-8", buffering=1)
     proc = subprocess.Popen(argv, stdout=fh, stderr=subprocess.DEVNULL,
@@ -1285,6 +1295,7 @@ def run_mode(mode, args, run_dir):
     # （含启动/NCCL 建连那几十秒，单步均摊时按步数摊掉）。
     net_procs = {rank: start_net_sampler(rank, mode_dir / f"net_node{rank}.csv")
                  for rank in (0, 1)}
+    _STATE["net_procs"] = net_procs  # 信号中断时 cleanup_nodes 里兜底收掉
 
     print(f"\n[1/3] 起 node1（后台，{NODES[1]['name']}）…")
     proc1 = stream_node(NODES[1]["host"], args.container, script_paths[1],
