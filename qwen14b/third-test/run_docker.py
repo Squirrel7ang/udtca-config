@@ -5,7 +5,7 @@
   * node0 = 本机，宿主机执行 `docker exec trj-udtca ...`
   * node1 = powerone2，宿主机执行 `ssh <node1> 'docker exec trj-udtca ...'`
 
-每个 mode（默认 mixed 先、baseline 后）跑之前先过一道卡检查（见 card_precheck）：
+每个 mode（默认 polar 先、baseline 后）跑之前先过一道卡检查（见 card_precheck）：
   * 占用：两台节点容器里 `ixsmi --query-gpu/--query-compute-apps`，有人在用就不启动
   * 健康：宿主机 `journalctl -k -b` 里出现 page fault / vmid（Corex XID 24）就不启动
   任一台不干净，本轮（含后续 mode）直接跳过，不启动训练。
@@ -29,7 +29,7 @@
      此外本次运行的**完整** stdout/stderr（横幅、预检、两机 torchrun 实时输出、
      汇总、分析）从一开始就同时落到 `<run>/run_docker.stdout.log`，不依赖调用方
      把输出重定向到 /tmp。
-     baseline vs mixed 的对比里包含步时/吞吐、DP-PP 重叠率、DP 通信压缩比，
+     baseline vs polar 的对比里包含步时/吞吐、DP-PP 重叠率、DP 通信压缩比，
      以及跨机线上流量（网卡计数器，按单步均摊后比——两边步数可能不同）。
 
 profiler：**无条件关闭**（生成的脚本固定 `--disable-profiler true`）。这版 Corex
@@ -43,9 +43,9 @@ profiler：**无条件关闭**（生成的脚本固定 `--disable-profiler true`
 8 s 后仍在的再 SIGKILL。注意 Corex 上打断在途 NCCL 有 XID 24 风险，这是你要的行为。
 
 用法：
-    python3 run_docker.py                      # mixed 先跑、再 baseline，各 5 iter，不开 profiler
-    python3 run_docker.py --only-baseline      # 只跑 baseline，不跑 mixed
-    python3 run_docker.py --modes mixed        # 只跑 mixed
+    python3 run_docker.py                      # polar 先跑、再 baseline，各 5 iter，不开 profiler
+    python3 run_docker.py --only-baseline      # 只跑 baseline，不跑 polar
+    python3 run_docker.py --modes polar        # 只跑 polar
     python3 run_docker.py --max-steps 10       # 每个 mode 跑 10 iter
     python3 run_docker.py --max-steps 3        # 冒烟
     python3 run_docker.py --dry-run            # 只打印生成的脚本，什么都不启动
@@ -88,7 +88,7 @@ RUN_LABELS = {
     "baseline": "baseline_ddp_xnode",
     "polar_dense": "polar_dense_xnode",
     "bitscom": "bitscom_quant_xnode",
-    "mixed": "polar_bitscom_xnode",
+    "polar": "polar_bitscom_xnode",
 }
 
 # 四种 mode 各自要追加的训练参数（与 cloud/edge 的 run_xnode_*.sh 一致）。
@@ -109,7 +109,7 @@ METHOD_ARGS = {
         "--using-polar false --polar-hook none --comm-timing 0",
         "--method bitscom --bitwidth 2",
     ],
-    "mixed": [
+    "polar": [
         "--baseline-mode manual",
         "--using-polar true --polar-hook ef_lowmem --comm-timing 8",
         "--polar-bucket-numel 64000000 --polar-max-inflight-buckets 1",
@@ -1451,41 +1451,41 @@ def summary_table(rows):
 
 def compare(rows):
     by = {r["mode"]: r for r in rows}
-    b, m = by.get("baseline"), by.get("mixed")
+    b, m = by.get("baseline"), by.get("polar")
     out = []
     if b and m and b.get("avg_step_s") and m.get("avg_step_s"):
-        out.append(f"步时   baseline={b['avg_step_s']:.2f}s  mixed={m['avg_step_s']:.2f}s  "
+        out.append(f"步时   baseline={b['avg_step_s']:.2f}s  polar={m['avg_step_s']:.2f}s  "
                    f"加速={b['avg_step_s'] / m['avg_step_s']:.2f}x")
     if b and m and b.get("throughput_tok_s") and m.get("throughput_tok_s"):
         out.append(f"吞吐   baseline={b['throughput_tok_s']:.1f} tok/s  "
-                   f"mixed={m['throughput_tok_s']:.1f} tok/s  "
+                   f"polar={m['throughput_tok_s']:.1f} tok/s  "
                    f"ratio={m['throughput_tok_s'] / b['throughput_tok_s']:.2f}x")
     # 端到端线上流量：直接读两机跨机网卡计数器，只有出网卡的 DP 同步在里面，
-    # 单机 TP/PP 不计入。按步均摊后再比，因为 baseline/mixed 的步数可能不同。
+    # 单机 TP/PP 不计入。按步均摊后再比，因为 baseline/polar 的步数可能不同。
     nb, nm = (_net_per_step(b) if b else None), (_net_per_step(m) if m else None)
     if nb and nm:
         out.append(f"线上流量 跨机网卡（单步均摊）: baseline={_fmt_gb(nb / 1e9)}GB  "
-                   f"mixed={_fmt_gb(nm / 1e9)}GB  "
+                   f"polar={_fmt_gb(nm / 1e9)}GB  "
                    f"降低={_fmt_gb((nb - nm) / 1e9)}GB ({nb / nm:.2f}x)")
     # 实时口径：DP-PP 重叠率 / 压缩比。baseline 的 DP 同步是串行做的，也应该
     # 测得到（正常就是 0%）；测不到只可能是指标打印没走到。
     ov_b, ov_m = (_rt_mean(b, "rt_overlap_mean") if b else None), \
                  (_rt_mean(m, "rt_overlap_mean") if m else None)
     if ov_m is not None:
-        out.append(f"重叠率 DP-PP（实时均值）: baseline={_fmt_pct(ov_b)}  mixed={_fmt_pct(ov_m)}")
+        out.append(f"重叠率 DP-PP（实时均值）: baseline={_fmt_pct(ov_b)}  polar={_fmt_pct(ov_m)}")
     elif b and m:
         out.append("重叠率 DP-PP: 实时口径未测到（检查两机日志里有没有 [rt-metric]），无 trace 可参考")
     red = _rt_mean(m, "rt_comm_reduction_mean") if m else None
     if red is not None:
-        out.append(f"压缩比（实时均值）: mixed {red:.2f}x   "
+        out.append(f"压缩比（实时均值）: polar {red:.2f}x   "
                    f"每步 dense={_fmt_gb(_rt_mean(m, 'rt_comm_dense_gb'))}GB → "
                    f"compressed={_fmt_gb(_rt_mean(m, 'rt_comm_compressed_gb'))}GB")
     if b and m:
         bit = [f"loss baseline={_fmt(b.get('final_loss_node0'), 4)} "
-               f"mixed={_fmt(m.get('final_loss_node0'), 4)}"]
+               f"polar={_fmt(m.get('final_loss_node0'), 4)}"]
         out.extend(bit)
     if not out:
-        out.append("（缺少 baseline 或 mixed 的步时数据，不做对比）")
+        out.append("（缺少 baseline 或 polar 的步时数据，不做对比）")
     return "\n".join(out)
 
 
@@ -1493,13 +1493,13 @@ def compare(rows):
 
 def make_arg_parser():
     p = argparse.ArgumentParser(
-        description="跨机 Qwen14B：mixed/baseline 各 5 iter（默认不开 profiler）+ 自动分析",
+        description="跨机 Qwen14B：polar/baseline 各 5 iter（默认不开 profiler）+ 自动分析",
         epilog="必须在 powerone1 的宿主机上运行（容器里没有 docker）。")
     p.add_argument("--modes", default=None,
-                   help="逗号分隔，可选 baseline|polar_dense|bitscom|mixed（按顺序跑；"
-                        "不写则默认 mixed,baseline）")
+                   help="逗号分隔，可选 baseline|polar|polar_dense|bitscom（按顺序跑；"
+                        "不写则默认 polar,baseline）")
     p.add_argument("--only-baseline", action="store_true",
-                   help="只跑 baseline、不跑 mixed（等价于 --modes baseline，二者同时给出时以本参数为准）")
+                   help="只跑 baseline、不跑 polar（等价于 --modes baseline，二者同时给出时以本参数为准）")
     p.add_argument("--repo", default=DEFAULT_REPO, help="两台机器上相同的仓库根路径")
     p.add_argument("--container", default="trj-udtca")
     p.add_argument("--ssh-target", default=SSH["target"], help="ssh 到 node1 的目标（默认 powerone2）")
@@ -1592,7 +1592,7 @@ def main():
                   file=sys.stderr)
         modes = ["baseline"]
     else:
-        modes = [m.strip() for m in (args.modes or "mixed,baseline").split(",") if m.strip()]
+        modes = [m.strip() for m in (args.modes or "polar,baseline").split(",") if m.strip()]
     for m in modes:
         if m not in METHOD_ARGS:
             print(f"未知 mode: {m}", file=sys.stderr)

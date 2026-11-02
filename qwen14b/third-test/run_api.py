@@ -15,7 +15,7 @@
 两件事：
 
 1. **启动训练**：把同目录的 run_docker.py 作为子进程拉起（默认只跑
-   `--modes mixed`，要 baseline 显式传 `--modes mixed,baseline`）；它的 stdout 会实时回显，同时由 run_docker 自己
+   `--modes polar`，要 baseline 显式传 `--modes polar,baseline`）；它的 stdout 会实时回显，同时由 run_docker 自己
    tee 到 `<run_dir>/run_docker.stdout.log`。
 2. **实时输出重叠率 / 压缩量**：run_docker 的产物是
    `run_log/xnode_<ts>/<mode>/node{0,1}/train.log`，而 metrics_api 只认
@@ -26,11 +26,11 @@
 
 用法（powerone1 宿主机上执行，容器里没有 docker）：
 
-    # 起训练（默认只跑 mixed）+ API
+    # 起训练（默认只跑 polar）+ API
     python3 udtca-config/qwen14b/third-test/run_api.py --max-steps 5
 
     # 只跑训练里的某几个 mode、换端口
-    python3 udtca-config/qwen14b/third-test/run_api.py --modes mixed --max-steps 30 --port 8001
+    python3 udtca-config/qwen14b/third-test/run_api.py --modes polar --max-steps 30 --port 8001
 
     # 训练已经在跑：只把 API 挂到某次 xnode run 上
     python3 udtca-config/qwen14b/third-test/run_api.py --no-training \
@@ -70,7 +70,7 @@ MODE_KIND = {
     "baseline": "baseline",
     "polar_dense": "polar",
     "bitscom": "bitscom",
-    "mixed": "polar",
+    "polar": "polar",
 }
 
 
@@ -251,8 +251,8 @@ def make_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--no-training", action="store_true",
                    help="不起训练，只把 API 挂到已有的 xnode run 上")
-    p.add_argument("--modes", default="mixed",
-                   help="传给 run_docker 的 --modes（默认只跑 mixed；要对比再传 mixed,baseline）")
+    p.add_argument("--modes", default="polar",
+                   help="传给 run_docker 的 --modes（默认只跑 polar；要对比再传 polar,baseline）")
     p.add_argument("--max-steps", type=int, default=None,
                    help="传给 run_docker 的 --max-steps")
     p.add_argument("--repo", default=str(REPO_ROOT),
