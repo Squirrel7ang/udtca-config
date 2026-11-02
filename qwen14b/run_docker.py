@@ -21,14 +21,16 @@
      * 步时口径：step_csv 里最后一级 stage 的逐步耗时；
      * 实时口径：每步 `[rt-metric]` 的 DP-PP 重叠率、pp_ms/dp_ms、通信
        dense/compressed/saved、压缩比（只有开 polar 的 mode 有）；
-     * 通信量：`logs/nccl_*.log` 里 NCCL 自报的集合通信 payload 字节，两节点合计
-       （口径同 udtca-config/utils/parse_nccl_bytes.py）。
+     * 线上流量：两机跨机网卡（NCCL_SOCKET_IFNAME）的 rx/tx 字节计数器，训练期间
+       1 Hz 采样。只有出网卡的 DP 同步计入，单机 TP/PP 不计；含协议头/重传。
+     * 参考：`logs/nccl_*.log` 里 NCCL 自报的集合通信 payload（每 rank 逻辑字节，
+       有 ring/tree 重复计数，只落 summary.json，不出现在对比里）。
      结果同时打到终端和 `<run>/analysis.log`、`<run>/metrics.log`、`<run>/summary.md`。
      此外本次运行的**完整** stdout/stderr（横幅、预检、两机 torchrun 实时输出、
      汇总、分析）从一开始就同时落到 `<run>/run_docker.stdout.log`，不依赖调用方
      把输出重定向到 /tmp。
-     baseline vs mixed 的对比里包含步时/吞吐、DP-PP 重叠率、DP 通信压缩比。
-     （端到端 NCCL 通信量只落 summary.json，不输出：里面混着单机的 TP/PP 流量。）
+     baseline vs mixed 的对比里包含步时/吞吐、DP-PP 重叠率、DP 通信压缩比，
+     以及跨机线上流量（网卡计数器，按单步均摊后比——两边步数可能不同）。
 
 profiler：**无条件关闭**（生成的脚本固定 `--disable-profiler true`）。这版 Corex
 栈上 CUPTI 一采集，设备侧 kernel 就不再完成（2026-11-01 两轮复现：进 profiler 后
@@ -1139,10 +1141,124 @@ def metrics_report(rows, args):
                 f"saved={_fmt_gb(rt['rt_comm_saved_gb'])}GB "
                 f"压缩比={_fmt(rt['rt_comm_reduction_mean'], 2)}x")
 
-        # 端到端 NCCL 通信量（含单机 TP/PP）不输出：优化只作用于跨机的 DP 同步，
-        # 混进单机流量后这个比值没有意义。原始数据仍在 summary.json 里备查。
+        nets = r.get("nets") or {}
+        if any(nets.get(k) for k in (0, 1)):
+            add("  端到端线上流量（跨机网卡 rx/tx 计数器，1 Hz 采样；单机 TP/PP 不出网卡）:")
+            total = 0
+            for rank in (0, 1):
+                n = nets.get(rank)
+                if not n:
+                    add(f"    node{rank} {NODES[rank]['name']}: 未测得")
+                    continue
+                total += n["tx_bytes"]
+                add(f"    node{rank} {NODES[rank]['name']}: "
+                    f"TX {_fmt_gb(n['tx_bytes'] / 1e9)} GB ({_fmt(n['tx_mbps'], 1)} Mbps)  "
+                    f"RX {_fmt_gb(n['rx_bytes'] / 1e9)} GB ({_fmt(n['rx_mbps'], 1)} Mbps)  "
+                    f"采样 {n['samples']} 次 / {_fmt(n['window_s'], 0)}s")
+            steps = r.get("num_steps") or 0
+            add(f"    合计线上字节（两机 TX 之和，RX 与对端 TX 基本相等）"
+                f" {_fmt_gb(total / 1e9)} GB"
+                + (f"，单步均摊 {_fmt_gb(total / steps / 1e9)} GB" if steps else "")
+                + "（含启动/NCCL 建连阶段）")
+        else:
+            add("  端到端线上流量: 未测得（网卡计数器没读到，检查 ifname / ssh）")
     add("")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 跨机线上流量
+#
+# NCCL 日志里的 payload 是每个 rank 各自记账的逻辑字节，ring/tree 会把同一块数据
+# 重复计数，和 1 Gbps 链路上真正跑的字节差一个数量级。要看端到端流量就直接读两机
+# 跨机网卡的字节计数器：只含出网卡的流量（DP 同步），单机 TP/PP 不经过它；代价是
+# 含协议头/重传，也可能混进同一条链路上其他租户的流量。
+# 采样随 mode 一起起跑、一起停，1 Hz，原始样本存 mode_dir/net_node{rank}.csv。
+
+NET_IF = {}  # main() 里按命令行覆盖
+
+NET_SAMPLE_LOOP = (
+    "while :; do "
+    "r=$(cat /sys/class/net/@@if@@/statistics/rx_bytes 2>/dev/null) || break; "
+    "t=$(cat /sys/class/net/@@if@@/statistics/tx_bytes 2>/dev/null) || break; "
+    "echo \"$(date +%s.%N) $r $t\"; sleep 1; done"
+)
+
+
+def start_net_sampler(rank, out_path):
+    node = NODES[rank]
+    ifname = NET_IF.get(rank) or node["ifname"]
+    argv = _on(node["host"], NET_SAMPLE_LOOP.replace("@@if@@", ifname))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(out_path, "w", encoding="utf-8", buffering=1)
+    proc = subprocess.Popen(argv, stdout=fh, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+    proc._log_fh = fh
+    return proc
+
+
+def stop_net_sampler(proc):
+    """停本进程自己起的采样 shell/ssh（不是训练进程，不受“不准发信号”约束）。"""
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+    fh = getattr(proc, "_log_fh", None)
+    if fh:
+        fh.close()
+
+
+def parse_net_samples(path):
+    """解析 1 Hz 采样，返回整段窗口的 rx/tx 字节与平均速率。"""
+    try:
+        text = Path(path).read_text(errors="ignore")
+    except OSError:
+        return None
+    rows = []
+    for line in text.splitlines():
+        p = line.split()
+        if len(p) != 3:
+            continue
+        try:
+            rows.append((float(p[0]), int(p[1]), int(p[2])))
+        except ValueError:
+            continue
+    if len(rows) < 2:
+        return None
+
+    def _delta(idx):
+        total = 0
+        for a, b in zip(rows, rows[1:]):
+            d = b[idx] - a[idx]
+            if d >= 0:  # 计数器回绕/网卡重建时丢弃负跳变
+                total += d
+        return total
+
+    dur = rows[-1][0] - rows[0][0]
+    rx, tx = _delta(1), _delta(2)
+    return {
+        "samples": len(rows),
+        "window_s": round(dur, 1),
+        "rx_bytes": rx,
+        "tx_bytes": tx,
+        "rx_mbps": round(rx * 8 / dur / 1e6, 1) if dur > 0 else None,
+        "tx_mbps": round(tx * 8 / dur / 1e6, 1) if dur > 0 else None,
+    }
+
+
+def _net_total(r):
+    """两节点各自发出的字节之和。只用 tx：同一块数据会同时出现在一端 tx 和另一端
+    rx，rx+tx 会把线上流量算两遍。"""
+    nets = r.get("nets") or {}
+    vals = [n["tx_bytes"] for n in nets.values() if n]
+    return sum(vals) if vals else None
+
+
+def _net_per_step(r):
+    total, steps = _net_total(r), r.get("num_steps")
+    return total / steps if total and steps else None
 
 
 # ---------------------------------------------------------------- 单个 mode
@@ -1165,6 +1281,11 @@ def run_mode(mode, args, run_dir):
 
     started = time.time()
 
+    # 跨机网卡计数器 1 Hz 采样，从起跑一直采到两机收尾；训练期间的数据都在里面
+    # （含启动/NCCL 建连那几十秒，单步均摊时按步数摊掉）。
+    net_procs = {rank: start_net_sampler(rank, mode_dir / f"net_node{rank}.csv")
+                 for rank in (0, 1)}
+
     print(f"\n[1/3] 起 node1（后台，{NODES[1]['name']}）…")
     proc1 = stream_node(NODES[1]["host"], args.container, script_paths[1],
                         mode_dir / "node1.ssh.log", live=False)
@@ -1180,9 +1301,13 @@ def run_mode(mode, args, run_dir):
         for line in tail:
             print("    " + line)
         print("    node0 不启动，跳过本 mode 剩下的内容。")
+        for p in net_procs.values():
+            stop_net_sampler(p)
         return {"mode": mode, "case_dir": str(mode_dir), "started": started,
                 "exit0": "not-started", "exit1": str(proc1.returncode),
                 "node0": str(mode_dir / "node0"), "node1": str(mode_dir / "node1"),
+                "nets": {rank: parse_net_samples(mode_dir / f"net_node{rank}.csv")
+                         for rank in (0, 1)},
                 "timed_out": False, "node1_died_early": True}
 
     print("[3/3] 起 node0（前台，实时回显）…")
@@ -1201,6 +1326,8 @@ def run_mode(mode, args, run_dir):
     rc1, timed_out1 = wait_proc(proc1, args.timeout_s, "node1")
     metrics_stop.set()
     _STATE["proc0"] = _STATE["proc1"] = None
+    for p in net_procs.values():
+        stop_net_sampler(p)
 
     for p in (proc0, proc1):
         fh = getattr(p, "_log_fh", None)
@@ -1219,6 +1346,8 @@ def run_mode(mode, args, run_dir):
         "exit1": exit1.replace("EXIT_CODE=", "").strip() or str(rc1),
         "node0": str(mode_dir / "node0"),
         "node1": str(mode_dir / "node1"),
+        "nets": {rank: parse_net_samples(mode_dir / f"net_node{rank}.csv")
+                 for rank in (0, 1)},
         "timed_out": timed_out0 or timed_out1,
         "node1_died_early": False,
     }
@@ -1290,9 +1419,11 @@ def _rt_mean(r, key):
 def summary_table(rows):
     hdr = (f"{'mode':10} {'exit0':>9} {'exit1':>9} {'loss0':>8} {'loss1':>8} "
            f"{'steps':>5} {'avg_step_s':>10} {'tok/s':>9} {'traces':>6} {'GB':>7} "
-           f"{'overlap':>8} {'压缩比':>8}")
+           f"{'overlap':>8} {'netGB':>8} {'net/st':>8} {'压缩比':>8}")
     lines = [hdr, "-" * len(hdr)]
     for r in rows:
+        total = _net_total(r)
+        per = _net_per_step(r)
         lines.append(
             f"{r['mode']:10} {str(r['exit0']):>9} {str(r['exit1']):>9} "
             f"{_fmt(r['final_loss_node0'], 4):>8} {_fmt(r['final_loss_node1'], 4):>8} "
@@ -1300,6 +1431,8 @@ def summary_table(rows):
             f"{_fmt(r['throughput_tok_s'], 1):>9} "
             f"{len(r['traces']):>6} {_fmt(r['trace_mb'] / 1024):>7} "
             f"{_fmt_pct(_rt_mean(r, 'rt_overlap_mean')):>8} "
+            f"{_fmt_gb(None if total is None else total / 1e9):>8} "
+            f"{_fmt_gb(None if per is None else per / 1e9):>8} "
             f"{_fmt(_rt_mean(r, 'rt_comm_reduction_mean')):>8}"
         )
     return "\n".join(lines)
@@ -1316,8 +1449,13 @@ def compare(rows):
         out.append(f"吞吐   baseline={b['throughput_tok_s']:.1f} tok/s  "
                    f"mixed={m['throughput_tok_s']:.1f} tok/s  "
                    f"ratio={m['throughput_tok_s'] / b['throughput_tok_s']:.2f}x")
-    # 跨机通信量/压缩量不在这里输出：端到端 NCCL payload 混着单机 TP/PP 流量，
-    # 比值没有意义；真正该看的是下面 [rt-metric] 的 DP 口径。
+    # 端到端线上流量：直接读两机跨机网卡计数器，只有出网卡的 DP 同步在里面，
+    # 单机 TP/PP 不计入。按步均摊后再比，因为 baseline/mixed 的步数可能不同。
+    nb, nm = (_net_per_step(b) if b else None), (_net_per_step(m) if m else None)
+    if nb and nm:
+        out.append(f"线上流量 跨机网卡（单步均摊）: baseline={_fmt_gb(nb / 1e9)}GB  "
+                   f"mixed={_fmt_gb(nm / 1e9)}GB  "
+                   f"降低={_fmt_gb((nb - nm) / 1e9)}GB ({nb / nm:.2f}x)")
     # 实时口径：DP-PP 重叠率 / 压缩比。baseline 的 DP 同步是串行做的，也应该
     # 测得到（正常就是 0%）；测不到只可能是指标打印没走到。
     ov_b, ov_m = (_rt_mean(b, "rt_overlap_mean") if b else None), \
@@ -1371,6 +1509,10 @@ def make_arg_parser():
     p.add_argument("--profiler-active-steps", type=int, default=2,
                    help="已废弃（profiler 强制关闭）")
     p.add_argument("--dataset-config", default="sample-10BT")
+    p.add_argument("--net-if0", default=None,
+                   help=f"node0 跨机网卡名（默认 {NODES[0]['ifname']}，即 NCCL_SOCKET_IFNAME）")
+    p.add_argument("--net-if1", default=None,
+                   help=f"node1 跨机网卡名（默认 {NODES[1]['ifname']}，即 NCCL_SOCKET_IFNAME）")
     p.add_argument("--warmup-s", type=int, default=25, help="node1 起来后等多少秒再起 node0")
     p.add_argument("--timeout-s", type=int, default=None,
                    help="单节点最长等待（默认不限；到点只停止等待，不杀进程）")
@@ -1428,6 +1570,10 @@ def main():
     SSH["target"] = args.ssh_target
     if args.ssh_opts.strip():
         SSH["opts"] = shlex.split(args.ssh_opts)
+    if args.net_if0:
+        NET_IF[0] = args.net_if0
+    if args.net_if1:
+        NET_IF[1] = args.net_if1
 
     if args.only_baseline:
         if args.modes and [m.strip() for m in args.modes.split(",") if m.strip()] != ["baseline"]:
