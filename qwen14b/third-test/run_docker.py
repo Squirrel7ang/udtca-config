@@ -43,7 +43,7 @@ profiler：**无条件关闭**（生成的脚本固定 `--disable-profiler true`
 8 s 后仍在的再 SIGKILL。注意 Corex 上打断在途 NCCL 有 XID 24 风险，这是你要的行为。
 
 用法：
-    python3 run_docker.py                      # polar 先跑、再 baseline，各 5 iter，不开 profiler
+    python3 run_docker.py                      # polar 先跑、再 baseline，各 20 iter，不开 profiler
     python3 run_docker.py --only-baseline      # 只跑 baseline，不跑 polar
     python3 run_docker.py --modes polar        # 只跑 polar
     python3 run_docker.py --max-steps 10       # 每个 mode 跑 10 iter
@@ -1537,7 +1537,9 @@ def make_arg_parser():
     p.add_argument("--ssh-opts", default="",
                    help='ssh 参数（给了就整体替换默认的 "-o BatchMode=yes -o ConnectTimeout=10"），'
                         '如 "-p 7122 -i /root/.ssh/id_rsa"')
-    p.add_argument("--max-steps", type=int, default=5)
+    # third-test 这一份默认跑 20 步：端到端加速比里固定开销（模型构建/NCCL 建连 ≈260 s）
+    # 占比太大，5 步不足以体现真实加速；qwen14b/run_docker.py 那份仍是 5。
+    p.add_argument("--max-steps", type=int, default=20)
     p.add_argument("--micro-batches", type=int, default=16)
     p.add_argument("--seq-len", type=int, default=256)
     p.add_argument("--gpus", type=int, default=16, help="每台机器的卡数")
