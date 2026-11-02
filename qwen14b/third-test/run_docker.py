@@ -180,10 +180,9 @@ export UDTCA_COMM_WATCHDOG_S="${UDTCA_COMM_WATCHDOG_S:-600}"
 export UDTCA_HTTP_READ_TIMEOUT_S="${UDTCA_HTTP_READ_TIMEOUT_S:-30}"
 export UDTCA_DATASET_RETRIES="${UDTCA_DATASET_RETRIES:-3}"
 export UDTCA_DATASET_STALL_S="${UDTCA_DATASET_STALL_S:-120}"
-# 梯度体检：默认 sanitize（坏 grad 就地清零并打 [gradguard] 行）；LOG_OK=1 让
-# 每步再打一行 all_finite，跑完直接 grep 就能确认有没有 NaN/Inf 梯度。
+# 梯度体检：默认 sanitize（坏 grad 就地清零并打 [gradguard] 行）；
+# 全部有限时不打日志（原先的 LOG_OK/all_finite 行已去掉）。
 export UDTCA_GRADGUARD="${UDTCA_GRADGUARD:-sanitize}"
-export UDTCA_GRADGUARD_LOG_OK="${UDTCA_GRADGUARD_LOG_OK:-1}"
 
 # 低比特 DP 同步严格串行（同 case_common：多 bucket 同时在飞会让两个 DP rank 的
 # p2p 投递顺序分叉，偶发卡死）。
