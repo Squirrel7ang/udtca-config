@@ -86,6 +86,8 @@ RUN_LABELS = {
 }
 
 # 四种 mode 各自要追加的训练参数（与 cloud/edge 的 run_xnode_*.sh 一致）。
+# 注意：mode "polar" 原来的名字是 "mixed"（POLAR + 2bit 量化），2026-11-02 起统一改名；
+#       旧命令 --modes mixed 已不再接受。
 METHOD_ARGS = {
     "baseline": [
         "--baseline-mode manual",

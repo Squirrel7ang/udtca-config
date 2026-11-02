@@ -65,6 +65,8 @@ DEPS_DIR = CONFIG_DIR / ".api_deps"
 if str(CONFIG_DIR) not in sys.path:
     sys.path.insert(0, str(CONFIG_DIR))
 
+# 注意：mode "polar" 原来的名字是 "mixed"（POLAR + 2bit 量化），2026-11-02 起统一改名，
+#       旧的 --modes mixed 已不再接受；这里 kind 仍叫 "polar"。
 # 各 mode 在 API 里叫什么 kind（前端只拿来做区分/上色）
 MODE_KIND = {
     "baseline": "baseline",

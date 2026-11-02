@@ -42,6 +42,8 @@ DP_SIZE=$((GPUS / (PP_SIZE * TP_SIZE)))
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$(seq -s, 0 $((GPUS - 1)))}"
 
 # 四种模式各自需要追加的训练参数，全放在 METHOD_ARGS 里，torchrun 末尾统一展开。
+# 注意：polar 这个 mode 原来的名字是 mixed（POLAR + 2bit 量化），2026-11-02 起统一改名；
+#       旧命令 MODE=mixed 已不再接受。
 case "$MODE" in
   baseline)
     RUN_LABEL=baseline_ddp_single

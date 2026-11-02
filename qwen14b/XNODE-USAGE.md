@@ -38,6 +38,9 @@ MODE=polar bash cloud/run_xnode.sh
 | `bitscom` | 低比特压缩，不用 polar |
 | `polar` | Polar + bitscom（默认关注的对象） |
 
+> 命名变更（2026-11-02）：`polar` 这个 MODE 原来叫 `mixed`（POLAR + 2bit 量化），
+> 现在统一用 `polar`；旧的 `MODE=mixed` / `--modes mixed` 已不再接受。
+
 ## 常用覆盖
 
 ```bash

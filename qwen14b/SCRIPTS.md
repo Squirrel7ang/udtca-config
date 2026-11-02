@@ -42,6 +42,9 @@ MODE=baseline bash edge/run_single_node_8gpu.sh     # 边侧 powerone2
 | `bitscom` | off | on | `bitscom_quant_single` |
 | `polar` | on | on | `polar_bitscom_single` |
 
+> 命名变更（2026-11-02）：`polar` 这个 MODE 原来叫 `mixed`（POLAR + 2bit 量化），
+> 现在统一用 `polar`；旧的 `MODE=mixed` / `--modes mixed` 已不再接受。
+
 低比特 DP 同步默认**严格串行**（`POLAR_EF_LOWMEM_SERIAL_BUCKETS=1`）。lowbit 的
 phase1/phase2/restore 共用同一个 comm，多个 bucket 同时在飞时两个 DP rank 的 p2p
 投递顺序会分叉、偶发卡死；串行后一个 bucket 完全 restore 才发下一个。正确性优先，
