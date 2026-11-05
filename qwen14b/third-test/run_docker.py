@@ -5,7 +5,11 @@
   * node0 = 本机，宿主机执行 `docker exec trj-udtca ...`
   * node1 = powerone2，宿主机执行 `ssh <node1> 'docker exec trj-udtca ...'`
 
-每个 mode（默认 polar 先、baseline 后）跑之前先过一道卡检查（见 card_precheck）：
+third-test 只有两项对比：**我们的方法（polar）** 和 **Baseline（Megatron）**，
+默认就是这两个 mode（polar 先、Megatron 后）。旧的 torch-DDP baseline 不再参与
+third-test，需要时显式 `--modes baseline`。
+
+每个 mode 跑之前都先过一道卡检查（见 card_precheck）：
   * 占用：两台节点容器里 `ixsmi --query-gpu/--query-compute-apps`，有人在用就不启动
   * 健康：宿主机 `journalctl -k -b` 里出现 page fault / vmid（Corex XID 24）就不启动
   任一台不干净，本轮（含后续 mode）直接跳过，不启动训练。
@@ -29,8 +33,21 @@
      此外本次运行的**完整** stdout/stderr（横幅、预检、两机 torchrun 实时输出、
      汇总、分析）从一开始就同时落到 `<run>/run_docker.stdout.log`，不依赖调用方
      把输出重定向到 /tmp。
-     baseline vs polar 的对比里包含步时/吞吐、DP-PP 重叠率、DP 通信压缩比，
+     最终对比（polar vs Megatron）里包含步时/吞吐、DP-PP 重叠率、DP 通信压缩比，
      以及跨机线上流量（网卡计数器，按单步均摊后比——两边步数可能不同）。
+
+  mode=megatron 就是 third-test 的 Baseline：同一个 Qwen2.5-14B、同一份全局 batch、同样的
+  PP/TP 切分，DP 用 `--use-tp-pp-dp-mapping` 走跨机（默认普通 DDP，不加
+  distributed optimizer）。指标不来自 polar wrapper，而是
+  `third-test/megatron/megatron_probe.py` 在 Megatron 的 train_step / 流水线调度 /
+  DP 梯度同步三处打点，产出**同格式**的 `[rt-metric]` 和 step_csv：
+  pp_ms=流水线窗口、dp_ms=DP 梯度同步窗口、dp_pp_overlap=被计算掩盖的 DP 时间占比。
+  普通 DDP 的同步是在计算流上阻塞发出的，重叠率实测应为 0（这正是 polar 要赢的地方）。
+
+  通信口径：`--bf16` 在 Megatron 里会自动打开 accumulate_allreduce_grads_in_fp32，
+  梯度 all-reduce 是 **fp32**，字节数是 polar bf16 all-reduce 的两倍（实测每节点
+  42.6GB vs polar 34.4GB，比值 1.24 ≈ 耗时比 1.33）。所以默认显式加
+  `--grad-reduce-in-bf16` 把两边拉齐；要复现 fp32 默认用 `--megatron-fp32-grad-reduce`。
 
 profiler：**无条件关闭**（生成的脚本固定 `--disable-profiler true`）。这版 Corex
 栈上 CUPTI 一采集，设备侧 kernel 就不再完成（2026-11-01 两轮复现：进 profiler 后
@@ -43,9 +60,10 @@ profiler：**无条件关闭**（生成的脚本固定 `--disable-profiler true`
 8 s 后仍在的再 SIGKILL。注意 Corex 上打断在途 NCCL 有 XID 24 风险，这是你要的行为。
 
 用法：
-    python3 run_docker.py                      # polar 先跑、再 baseline，各 20 iter，不开 profiler
-    python3 run_docker.py --only-baseline      # 只跑 baseline，不跑 polar
+    python3 run_docker.py                      # 我们的方法 polar + Baseline Megatron，各 20 iter
+    python3 run_docker.py --only-baseline      # 只跑 Baseline（Megatron），不跑 polar
     python3 run_docker.py --modes polar        # 只跑 polar
+    python3 run_docker.py --modes baseline     # 旧 torch-DDP baseline（不属于 third-test）
     python3 run_docker.py --max-steps 10       # 每个 mode 跑 10 iter
     python3 run_docker.py --max-steps 3        # 冒烟
     python3 run_docker.py --dry-run            # 只打印生成的脚本，什么都不启动
@@ -90,6 +108,7 @@ RUN_LABELS = {
     "polar_dense": "polar_dense_xnode",
     "bitscom": "bitscom_quant_xnode",
     "polar": "polar_bitscom_xnode",
+    "megatron": "megatron_baseline_xnode",
 }
 
 # 四种 mode 各自要追加的训练参数（与 cloud/edge 的 run_xnode_*.sh 一致）。
@@ -118,8 +137,142 @@ METHOD_ARGS = {
         "--polar-bucket-numel 64000000 --polar-max-inflight-buckets 1",
         "--method bitscom --bitwidth 2",
     ],
+    # Megatron 的参数不走这个列表（入口和参数集完全不同），见 MEGATRON_SCRIPT_TEMPLATE。
+    # 这里留空只为让 mode 名进 MODES 校验。
+    "megatron": [],
 }
 
+# ---------------------------------------------------------------- Megatron baseline
+#
+# third-test 除了 polar 自己的 DDP baseline，还要跑一条 Megatron-Core baseline 做对比：
+# 同一个模型（Qwen2.5-14B）、同一份全局 batch、同样的 PP/TP/DP 切分，DP 跨机。
+# 探针 megatron_probe.py 在第三层子目录里，不占 third-test 顶层。
+
+MEGATRON_PROBE_SUBPATH = "udtca-config/qwen14b/third-test/megatron/megatron_probe.py"
+DEFAULT_MEGATRON_RUNTIME = "/data1/tangruijing/megatron-runtime"
+
+MEGATRON_SCRIPT_TEMPLATE = r"""#!/usr/bin/env bash
+# run_docker.py 生成 —— mode=megatron(baseline) node=@@rank@@  (@@ts@@)
+set -uo pipefail
+REPO_ROOT=@@repo@@
+PROBE="$REPO_ROOT/@@probe@@"
+MG_RUNTIME=@@mg_runtime@@
+CASE_DIR=@@case_dir@@
+mkdir -p "$CASE_DIR/logs"
+RUN_LOG="$CASE_DIR/run.log"
+TEE=(tee -a "$CASE_DIR/train.log" "$RUN_LOG")
+
+# ---- 容器内 Corex 环境（与 polar 脚本保持一致）----
+export COREX_PATH=/usr/local/corex
+export CUDA_HOME="$COREX_PATH"
+export CPATH="$COREX_PATH/include"
+export LIBRARY_PATH="$COREX_PATH/lib64"
+export TRITON_CUDA_SYSROOT="$COREX_PATH"
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export PATH=/usr/local/corex/bin:/usr/local/corex/lib64/python3/dist-packages/bin:$PATH
+export LD_LIBRARY_PATH="$COREX_PATH/lib64:/usr/local/openmpi/lib:/usr/local/lib"
+# Megatron 运行时 + 探针目录（探针要在 pretrain_gpt 之前 import）
+export PYTHONPATH="$MG_RUNTIME:$(dirname "$PROBE"):/usr/local/corex/lib64/python3/dist-packages"
+
+# ---- 通信（同 polar 脚本）----
+export NCCL_IB_DISABLE=1
+export NCCL_SOCKET_IFNAME=@@ifname@@
+export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
+export NCCL_SOCKET_RETRY_CNT="${NCCL_SOCKET_RETRY_CNT:-600}"
+export NCCL_SOCKET_RETRY_SLEEP_MSEC="${NCCL_SOCKET_RETRY_SLEEP_MSEC:-1000}"
+
+# ---- 输出 / 诊断 ----
+export PYTHONUNBUFFERED=1
+export PYTHONFAULTHANDLER=1
+export OMP_NUM_THREADS=4
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=0
+export TORCH_NCCL_ENABLE_MONITORING=0
+
+# ---- 探针：每步 [rt-metric] + step_csv ----
+export MEGATRON_RT_CSV_DIR="$CASE_DIR/step_csv"
+export MEGATRON_RT_TAG="node@@rank@@"
+
+cat > "$CASE_DIR/PRE_RUN.md" <<PRE
+# PRE_RUN @@ts@@
+- mode=megatron(baseline) node_rank=@@rank@@/2 master=@@master_addr@@:@@master_port@@
+- GPUs=@@gpus@@ PP=@@pp@@ TP=@@tp@@ DP=@@dp@@（--use-tp-pp-dp-mapping，DP 跨机）
+- steps=@@max_steps@@ global_batch=@@gbs@@（=micro_batches × DP）seq_len=@@seq_len@@ seed=@@seed@@
+- runtime=$MG_RUNTIME
+- dist_opt=@@dist_opt_label@@
+- grad_reduce=@@grad_reduce_label@@
+- nccl: ib_disable=$NCCL_IB_DISABLE ifname=$NCCL_SOCKET_IFNAME p2p_disable=$NCCL_P2P_DISABLE
+- generated by run_docker.py
+PRE
+
+echo "=== [XNODE] megatron node@@rank@@ start $(date -Is)" | "${TEE[@]}"
+echo "    case_dir=$CASE_DIR  runtime=$MG_RUNTIME" | "${TEE[@]}"
+
+cd "$REPO_ROOT"
+torchrun \
+  --nproc_per_node=@@gpus@@ \
+  --nnodes=2 \
+  --node_rank=@@rank@@ \
+  --master_addr=@@master_addr@@ \
+  --master_port=@@master_port@@ \
+  "$PROBE" --megatron-entry "$MG_RUNTIME/pretrain_gpt.py" -- \
+  --num-layers 48 \
+  --hidden-size 5120 \
+  --ffn-hidden-size 13824 \
+  --num-attention-heads 40 \
+  --group-query-attention \
+  --num-query-groups 8 \
+  --kv-channels 128 \
+  --max-position-embeddings 32768 \
+  --position-embedding-type rope \
+  --rotary-base 1000000 \
+  --rotary-percent 1.0 \
+  --swiglu \
+  --disable-bias-linear \
+  --untie-embeddings-and-output-weights \
+  --normalization RMSNorm \
+  --norm-epsilon 1e-6 \
+  --no-persist-layer-norm \
+  --attention-dropout 0.0 \
+  --hidden-dropout 0.0 \
+  --init-method-std 0.02 \
+  --tokenizer-type NullTokenizer \
+  --vocab-size 152064 \
+  --seq-length @@seq_len@@ \
+  --micro-batch-size 1 \
+  --global-batch-size @@gbs@@ \
+  --train-iters @@max_steps@@ \
+  --lr 2e-4 \
+  --lr-decay-style cosine \
+  --lr-warmup-fraction 0.01 \
+  --weight-decay 0.1 \
+  --adam-beta1 0.9 \
+  --adam-beta2 0.95 \
+  --adam-eps 1e-8 \
+  --clip-grad 1.0 \
+  --bf16 \
+  --distributed-backend nccl \
+  --transformer-impl local \
+  --attention-backend unfused \
+  --tensor-model-parallel-size @@tp@@ \
+  --pipeline-model-parallel-size @@pp@@ \
+  --use-tp-pp-dp-mapping \
+  --mock-data \
+  @@grad_reduce_args@@ \
+  --no-gradient-accumulation-fusion \
+  --no-masked-softmax-fusion \
+  --no-bias-swiglu-fusion \
+  --no-rope-fusion \
+  --log-interval 1 \
+  --eval-iters 0 \
+  --eval-interval 1000 \
+  --seed @@seed@@ \
+  @@dist_opt_args@@ \
+  @@extra_args@@ \
+  2>&1 | "${TEE[@]}"
+RC=${PIPESTATUS[0]}
+echo "EXIT_CODE=$RC" | tee -a "$CASE_DIR/EXIT_CODE" "$CASE_DIR/train.log" "$RUN_LOG"
+exit "$RC"
+"""
 
 # ---------------------------------------------------------------- 训练脚本模板
 
@@ -257,7 +410,59 @@ def _mode_args(mode, args):
     return argv
 
 
+def _megatron_build_values(rank, args, case_dir, ts):
+    """Megatron mode 的占位符取值（DP 永远是跨机那一路：--use-tp-pp-dp-mapping）。"""
+    dp = max((2 * args.gpus) // max(args.pp * args.tp, 1), 1)
+    gbs = args.micro_batches * dp
+    dist_opt = list(getattr(args, "megatron_dist_opt_args", []) or [])
+    extra = shlex.split(getattr(args, "megatron_extra_args", "") or "")
+    return {
+        "mode": "megatron",
+        "rank": rank,
+        "ts": ts,
+        "repo": args.repo,
+        "probe": MEGATRON_PROBE_SUBPATH,
+        "mg_runtime": args.megatron_runtime,
+        "case_dir": case_dir,
+        "ifname": NODES[rank]["ifname"],
+        "master_addr": NODES[0]["ip"],
+        "master_port": args.master_port,
+        "gpus": args.gpus,
+        "pp": args.pp,
+        "tp": args.tp,
+        "dp": dp,
+        "gbs": gbs,
+        "max_steps": args.max_steps,
+        "seq_len": args.seq_len,
+        "seed": args.seed,
+        "dist_opt_label": "on" if dist_opt else "off（普通 DDP，和 polar 的 baseline 口径一致）",
+        # --bf16 会自动把 accumulate_allreduce_grads_in_fp32 打开，梯度 all-reduce 变成
+        # fp32（字节数翻倍），和 polar 的 bf16 all-reduce 不同口径。默认显式压回 bf16。
+        "grad_reduce_args": "" if getattr(args, "megatron_fp32_grad_reduce", False)
+        else "--grad-reduce-in-bf16",
+        "grad_reduce_label": "fp32（--bf16 默认行为，跨机字节数 ×2）"
+        if getattr(args, "megatron_fp32_grad_reduce", False)
+        else "bf16（--grad-reduce-in-bf16，与 polar 的 all-reduce 同口径）",
+        "dist_opt_args": " ".join(dist_opt),
+        "extra_args": " ".join(extra),
+    }
+
+
+def _build_megatron_script(rank, args, case_dir, ts):
+    body = MEGATRON_SCRIPT_TEMPLATE
+    for key, val in _megatron_build_values(rank, args, case_dir, ts).items():
+        body = body.replace(f"@@{key}@@", str(val))
+    # dist_opt_args / extra_args 为空时会留下只有反斜杠的空续行，删掉
+    body = re.sub(r"\n[ \t]*\\[ \t]*(?=\n)", "", body)
+    leftovers = re.findall(r"@@[a-z_]+@@", body)
+    if leftovers:
+        raise ValueError(f"Megatron 模板里有未替换的占位符: {sorted(set(leftovers))}")
+    return body
+
+
 def build_script(mode, rank, args, case_dir, ts):
+    if mode == "megatron":
+        return _build_megatron_script(rank, args, case_dir, ts)
     # profiler 在这版 Corex 栈上**不可用**：一旦 CUPTI 开始采集，设备侧的 kernel
     # 就不再完成（2026-11-01 两次复现：8 秒内整机停摆，32 个 rank 全停在
     # autograd 引擎/forward 里，无 XID、无 trace 产出）。这里无条件关掉，
@@ -1128,7 +1333,9 @@ def metrics_report(rows, args):
     add("实时指标（[rt-metric] 每步一条）")
     add("=" * 78)
     add("  [rt-metric] 来自 polar wrapper（polar-sgd/src/psgd/parallelism/polar/wrapper.py），")
-    add("  和 run.py / metrics_api.py 同源；四种 mode 都有（baseline/bitscom 的重叠率预期为 0%）。")
+    add("  和 run.py / metrics_api.py 同源；baseline/bitscom 的重叠率预期为 0%。")
+    add("  mode=megatron 的行由 third-test/megatron/megatron_probe.py 在 Megatron 内部打点，")
+    add("  字段口径相同（pp_ms/dp_ms/dp_pp_overlap/comm_dense）。")
 
     for r in rows:
         add(f"\n## {r['mode']}   EXIT_CODE node0={r['exit0']} node1={r['exit1']}")
@@ -1479,6 +1686,10 @@ def compare(rows):
     by = {r["mode"]: r for r in rows}
     b, m = by.get("baseline"), by.get("polar")
     out = []
+    # 旧的 torch-DDP baseline 不再属于 third-test 的两项对比，只有显式 --modes baseline
+    # 跑到时才附在后面。
+    if b:
+        out.append("—— 附：旧 torch-DDP baseline vs polar（不属于 third-test 口径）——")
     if b and m and b.get("elapsed_s") and m.get("elapsed_s"):
         out.append(f"端到端 baseline={b['elapsed_s']:.1f}s  polar={m['elapsed_s']:.1f}s  "
                    f"加速={b['elapsed_s'] / m['elapsed_s']:.2f}x"
@@ -1514,8 +1725,45 @@ def compare(rows):
         bit = [f"loss baseline={_fmt(b.get('final_loss_node0'), 4)} "
                f"polar={_fmt(m.get('final_loss_node0'), 4)}"]
         out.extend(bit)
+
+    # ---- Megatron-Core baseline（mode=megatron）----
+    mg = by.get("megatron")
+    if mg:
+        out.append("")
+        out.append("—— 我们的方法（polar） vs Baseline（Megatron）——")
+        out.append("  同模型/同全局 batch/同 PP-TP 切分，DP 用 --use-tp-pp-dp-mapping 跨机")
+        if m and mg.get("avg_step_s") and m.get("avg_step_s"):
+            out.append(f"步时   megatron={mg['avg_step_s']:.2f}s  polar={m['avg_step_s']:.2f}s  "
+                       f"加速={mg['avg_step_s'] / m['avg_step_s']:.2f}x")
+        if m and mg.get("elapsed_s") and m.get("elapsed_s"):
+            out.append(f"端到端 megatron={mg['elapsed_s']:.1f}s  polar={m['elapsed_s']:.1f}s  "
+                       f"加速={mg['elapsed_s'] / m['elapsed_s']:.2f}x（拉起→两机退出）")
+        if m and mg.get("throughput_tok_s") and m.get("throughput_tok_s"):
+            out.append(f"吞吐   megatron={mg['throughput_tok_s']:.1f} tok/s  "
+                       f"polar={m['throughput_tok_s']:.1f} tok/s  "
+                       f"ratio={m['throughput_tok_s'] / mg['throughput_tok_s']:.2f}x")
+        ov = _rt_mean(mg, "rt_overlap_mean")
+        if ov is None:
+            out.append("重叠率 DP-PP（megatron）: 未测到（检查 Megatron 日志里有没有 [rt-metric]）")
+        else:
+            out.append(f"重叠率 DP-PP（megatron，实时均值）: {_fmt_pct(ov)}"
+                       "   ← 普通 DDP 的梯度同步在计算流上串行，理论上就该是 0")
+        pp_ms, dp_ms = _rt_mean(mg, "rt_pp_ms_mean"), _rt_mean(mg, "rt_dp_ms_mean")
+        if pp_ms is not None or dp_ms is not None:
+            out.append(f"  每步 pp_ms={_fmt(pp_ms)}  dp_ms={_fmt(dp_ms)}")
+        cd = _rt_mean(mg, "rt_comm_dense_gb")
+        if cd is not None:
+            out.append(f"  DP 梯度通信量（探针口径，未压缩）={_fmt_gb(cd)}GB/rank/step")
+        nmg = _net_per_step(mg)
+        if nmg and nm:
+            out.append(f"线上流量 跨机网卡（单步均摊）: megatron={_fmt_gb(nmg / 1e9)}GB  "
+                       f"polar={_fmt_gb(nm / 1e9)}GB  "
+                       f"降低={_fmt_gb((nmg - nm) / 1e9)}GB ({nmg / nm:.2f}x)")
+        if mg.get("final_loss_node0") is not None:
+            out.append("  （Megatron 用 --mock-data 跑，loss 与 polar 的真实数据不可比，"
+                       "这里只比时间和通信）")
     if not out:
-        out.append("（缺少 baseline 或 polar 的步时数据，不做对比）")
+        out.append("（缺少 polar 或 Baseline(Megatron) 的步时数据，不做对比）")
     return "\n".join(out)
 
 
@@ -1523,13 +1771,16 @@ def compare(rows):
 
 def make_arg_parser():
     p = argparse.ArgumentParser(
-        description="跨机 Qwen14B：polar/baseline 各 5 iter（默认不开 profiler）+ 自动分析",
+        description="跨机 Qwen14B：[我们的方法 polar] vs [Baseline = Megatron] 性能对比"
+                    "（默认不开 profiler）+ 自动分析",
         epilog="必须在 powerone1 的宿主机上运行（容器里没有 docker）。")
     p.add_argument("--modes", default=None,
-                   help="逗号分隔，可选 baseline|polar|polar_dense|bitscom（按顺序跑；"
-                        "不写则默认 polar,baseline）")
+                   help="逗号分隔，可选 polar|megatron（按顺序跑；不写则默认 polar,megatron）。"
+                        "baseline|polar_dense|bitscom 仍保留，但已不属于 third-test 的两项对比，"
+                        "需要时显式指定")
     p.add_argument("--only-baseline", action="store_true",
-                   help="只跑 baseline、不跑 polar（等价于 --modes baseline，二者同时给出时以本参数为准）")
+                   help="只跑 Baseline（megatron）、不跑 polar（等价于 --modes megatron，"
+                        "二者同时给出时以本参数为准）")
     p.add_argument("--repo", default=DEFAULT_REPO, help="两台机器上相同的仓库根路径")
     p.add_argument("--container", default="trj-udtca")
     p.add_argument("--ssh-target", default=SSH["target"], help="ssh 到 node1 的目标（默认 powerone2）")
@@ -1559,6 +1810,19 @@ def make_arg_parser():
                    help="权重保存根目录（容器内路径），须配合 --save-weights；"
                         "默认 <repo>/checkpoints/xnode")
     p.add_argument("--dataset-config", default="sample-10BT")
+    # ---- Megatron baseline（mode=megatron）----
+    p.add_argument("--megatron-runtime", default=DEFAULT_MEGATRON_RUNTIME,
+                   help=f"Megatron 运行时目录（容器内路径，默认 {DEFAULT_MEGATRON_RUNTIME}）")
+    p.add_argument("--megatron-dist-opt", action="store_true",
+                   help="Megatron 用 distributed optimizer 而不是普通 DDP。默认关："
+                        "polar 的 baseline 是 dense DP all-reduce，普通 DDP 才是同口径对比；"
+                        "DistOpt 会把梯度 reduce 拉成 fp32 + 多一次参数 all-gather，跨机流量多约 1.24 倍")
+    p.add_argument("--megatron-fp32-grad-reduce", action="store_true",
+                   help="梯度 all-reduce 用 fp32（--bf16 在 Megatron 里的默认行为）。"
+                        "默认不用：默认加 --grad-reduce-in-bf16，和 polar 的 bf16 all-reduce 同口径；"
+                        "fp32 会让跨机字节数翻倍，Megatron 被人为拖慢")
+    p.add_argument("--megatron-extra-args", default="",
+                   help='额外透传给 Megatron 的参数（整串，如 "--recompute-granularity full"）')
     p.add_argument("--net-if0", default=None,
                    help=f"node0 跨机网卡名（默认 {NODES[0]['ifname']}，即 NCCL_SOCKET_IFNAME）")
     p.add_argument("--net-if1", default=None,
@@ -1618,6 +1882,10 @@ def main():
     args = make_arg_parser().parse_args()
     if args.save_weights and not args.save_dir:
         args.save_dir = f"{args.repo}/checkpoints/xnode"
+    args.megatron_dist_opt_args = (
+        ["--use-distributed-optimizer", "--overlap-grad-reduce", "--overlap-param-gather"]
+        if args.megatron_dist_opt else []
+    )
     args._ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     SSH["target"] = args.ssh_target
     if args.ssh_opts.strip():
@@ -1628,12 +1896,14 @@ def main():
         NET_IF[1] = args.net_if1
 
     if args.only_baseline:
-        if args.modes and [m.strip() for m in args.modes.split(",") if m.strip()] != ["baseline"]:
-            print(f"--only-baseline 与 --modes {args.modes} 同时给出，以 --only-baseline 为准（只跑 baseline）",
-                  file=sys.stderr)
-        modes = ["baseline"]
+        if args.modes and [m.strip() for m in args.modes.split(",") if m.strip()] != ["megatron"]:
+            print(f"--only-baseline 与 --modes {args.modes} 同时给出，以 --only-baseline 为准"
+                  "（只跑 baseline = Megatron）", file=sys.stderr)
+        modes = ["megatron"]
     else:
-        modes = [m.strip() for m in (args.modes or "polar,baseline").split(",") if m.strip()]
+        # third-test 的对比口径：我们的方法（polar）vs Baseline（Megatron）。
+        # 旧的 torch-DDP baseline 不参与 third-test；确实要看时显式 --modes baseline。
+        modes = [m.strip() for m in (args.modes or "polar,megatron").split(",") if m.strip()]
     for m in modes:
         if m not in METHOD_ARGS:
             print(f"未知 mode: {m}", file=sys.stderr)
