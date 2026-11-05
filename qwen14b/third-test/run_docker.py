@@ -167,11 +167,13 @@ DEFAULT_MEGATRON_RUNTIME = "/workspace/megatron-runtime"
 DEFAULT_RUN_ROOT = "/data/tangruijing/third-test/run_log"
 # 真实数据：和 polar 同一份语料（HuggingFaceFW/fineweb sample-10BT），
 # prepare_data.py 用 datasets 流式下载、再用 Megatron 的 tools/preprocess_data.py 切成 bin/idx。
-DEFAULT_MEGATRON_DATA_DIR = "/data1/tangruijing/megatron-data/fineweb_sample-10BT"
+DEFAULT_MEGATRON_DATA_DIR = "/workspace/megatron-data/fineweb_sample-10BT"
 MEGATRON_DATA_PREFIX_NAME = "fineweb_sample-10BT"
 # 用 HF repo id 而不是本地目录：powerone2 上没有 /data1/tangruijing/models，
 # 而 HuggingFaceTokenizer 两边都要能拿到同一份 tokenizer（通过 hf-mirror 拉）。
 DEFAULT_MEGATRON_TOKENIZER = "Qwen/Qwen2.5-14B-Instruct"
+# 镜像里已经烤好 fineweb sample-10BT 的 bin/idx，默认就用真语料（los 与 polar 可比）。
+DEFAULT_MEGATRON_DATA_PATH = f"{DEFAULT_MEGATRON_DATA_DIR}/{MEGATRON_DATA_PREFIX_NAME}_text_document"
 
 MEGATRON_SCRIPT_TEMPLATE = r"""#!/usr/bin/env bash
 # run_docker.py 生成 —— mode=megatron(baseline) node=@@rank@@  (@@ts@@)
@@ -1878,12 +1880,9 @@ def make_arg_parser():
     p.add_argument("--max-steps", type=int, default=20)
     p.add_argument("--micro-batches", type=int, default=16)
     p.add_argument("--seq-len", type=int, default=256)
-    p.add_argument("--gpus", type=int, default=8,
-                   help="每台机器的卡数（third-test 默认 8：只用 8-15 这 8 张，其余卡有他人占用或历史故障）")
-    p.add_argument("--gpu-ids", default="8,9,10,11,12,13,14,15",
-                   help="CUDA_VISIBLE_DEVICES 白名单；空=用全部可见卡。"
-                        "默认 8-15（两台机器当前唯一空闲且健康的一组）")
-    p.add_argument("--pp", type=int, default=4, help="默认 4：配 8 卡/节点时 DP=2，正好跨机")
+    p.add_argument("--gpus", type=int, default=16, help="每台机器的卡数")
+    p.add_argument("--gpu-ids", default="", help="CUDA_VISIBLE_DEVICES 白名单（如 8,9,10,11,12,13,14,15）；空=用全部可见卡")
+    p.add_argument("--pp", type=int, default=8)
     p.add_argument("--tp", type=int, default=2)
     p.add_argument("--seed", type=int, default=1234)
     # 29630 在 powerone1 上会被 kube-apiserver 的临时端口占用，默认换成两机都空的端口。
@@ -1908,7 +1907,7 @@ def make_arg_parser():
                         "polar 的 baseline 是 dense DP all-reduce，普通 DDP 才是同口径对比；"
                         "DistOpt 会把梯度 reduce 拉成 fp32 + 多一次参数 all-gather，跨机流量多约 1.24 倍")
     # ---- Megatron 数据集（默认 mock；准备后两边就跑同一份 fineweb）----
-    p.add_argument("--megatron-data-path", default="",
+    p.add_argument("--megatron-data-path", default=DEFAULT_MEGATRON_DATA_PATH,
                    help="Megatron 预训练数据的 --data-path 前缀（不带 _text_document.bin），"
                         "两台机器路径相同、各自本地。不写则用 --mock-data")
     p.add_argument("--megatron-data-dir", default=DEFAULT_MEGATRON_DATA_DIR,

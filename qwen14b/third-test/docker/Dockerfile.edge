@@ -1,9 +1,8 @@
-# third-test 边侧（powerone2 / 10.205.200.16）冻结镜像
+# third-test 边侧（powerone2 / 10.205.200.14）冻结镜像
 #
-# 与云侧唯一的实质差异：边侧的 /usr/local/corex 运行时库需要被
-# /data1/tangruijing/docker_libs 下那一套替换（云侧用宿主机自带的）。
-# 这两处差异以前靠 docker run -v 覆盖，现在直接烧进镜像，
-# 运行期不再需要挂 /data1/tangruijing/docker_libs。
+# 全部依赖都烧进镜像：代码、Megatron 运行时、训练语料、psgd/bitscom 的
+# editable 安装（bitscom 的 C++/CUDA 扩展在构建时按本机编译）。
+# 运行期除了 /data、/home、/dev 这些宿主资源，不再依赖镜像外的任何代码。
 #
 #   docker build -t udtca-third-test:edge-20261105 \
 #       -f /data1/tangruijing/third-test/build/Dockerfile.edge \
@@ -13,8 +12,9 @@ FROM corex:4.5.0.20261008-ubuntu22.04-llm-py3.12-v2
 LABEL udtca.third-test.role="edge"
 LABEL udtca.third-test.host="powerone2"
 LABEL udtca.third-test.frozen="20261105"
-LABEL udtca.third-test.repo="/workspace/udtca"
-LABEL udtca.third-test.megatron="/workspace/megatron-runtime"
+
+ENV COREX_PATH=/usr/local/corex \
+    CUDA_HOME=/usr/local/corex
 
 # 边侧专属：替换 Corex 运行时库（与当前在跑的容器用同一份文件）
 COPY ctx/docker_libs/libcuda_a.so.1 /usr/local/corex/lib64/libcuda.so.1
@@ -24,11 +24,17 @@ COPY ctx/docker_libs/ixsmi          /usr/local/corex/bin/ixsmi
 
 COPY ctx/udtca            /workspace/udtca
 COPY ctx/megatron-runtime /workspace/megatron-runtime
+COPY ctx/megatron-data    /workspace/megatron-data
 
 COPY udtca_manifest.txt    /workspace/udtca_manifest.txt
 COPY megatron_manifest.txt /workspace/megatron_manifest.txt
 
-RUN mkdir -p /workspace/udtca/run_log && ln -sfn /data /data1 \
-    && chmod 755 /usr/local/corex/bin/ixsmi
+# editable 安装：往 site-packages 写 __editable__.psgd / __editable__.bitscom 的 .pth，
+# 指向 /workspace/udtca/{polar-sgd/src,bitscom/python}。bitscom 在这里按本机编译。
+RUN pip install --no-build-isolation --no-index -e /workspace/udtca/polar-sgd \
+ && pip install --no-build-isolation --no-index -e /workspace/udtca/bitscom \
+ && python -c "import psgd, bitscom; print('psgd:', psgd.__file__); print('bitscom:', bitscom.__file__)"
+
+RUN chmod 755 /usr/local/corex/bin/ixsmi && mkdir -p /workspace/udtca/run_log && ln -sfn /data /data1
 
 WORKDIR /workspace/udtca

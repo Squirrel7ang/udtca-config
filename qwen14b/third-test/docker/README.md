@@ -12,11 +12,20 @@
 ## 镜像里有什么
 
 ```
-/workspace/udtca             仓库（third-test 分支的代码）
-/workspace/megatron-runtime  Megatron-Core 运行时
-/workspace/udtca_manifest.txt      冻结时逐文件 md5（1149 个）
-/workspace/megatron_manifest.txt   同上（1745 个）
+/workspace/udtca              仓库（third-test 分支的代码）
+/workspace/megatron-runtime   Megatron-Core 运行时
+/workspace/megatron-data      fineweb sample-10BT 的 bin/idx 语料（17 MB）
+/workspace/udtca_manifest.txt      冻结时逐文件 md5
+/workspace/megatron_manifest.txt   同上
 ```
+
+另外构建时执行 `pip install --no-build-isolation --no-index -e` 安装
+`/workspace/udtca/polar-sgd` 和 `/workspace/udtca/bitscom`：site-packages 里会落下
+指向这两个目录的 `.pth`，`bitscom` 的 C++ 扩展（`_lowbit_*`）**在各自机器上单独编译**，
+不跨机器复用。
+
+运行期除了系统核心软件栈（Corex 驱动/运行时）和 bind mount 进来的 `/data`、`/home`、
+`/dev`，不再依赖镜像外的任何东西——代码、语料、Python 包全部在镜像里。
 
 日志不放进镜像：运行期 `/data` bind mount 进来，日志落宿主机
 `/data1/tangruijing/third-test/run_log/`。
@@ -59,4 +68,6 @@ docker save udtca-third-test:edge-20261105  | gzip > /data1/tangruijing/third-te
 python3 /data1/tangruijing/third-test/run_docker.py     # polar + megatron 各 20 iter，自动对比
 ```
 
-日志落在 `/data1/tangruijing/third-test/run_log/xnode_<ts>/`。
+默认就是 16 卡/节点、双机 32 卡（`--gpus 16 --pp 8 --tp 2` → DP=2 跨机），
+开跑前做全卡健康检查（`--skip-card-check` 才会跳过）。日志落在
+`/data1/tangruijing/third-test/run_log/xnode_<ts>/`。
