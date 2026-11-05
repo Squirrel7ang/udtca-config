@@ -14,14 +14,22 @@
      开/关整步计时事件、写 step_csv、打 `Step N, Loss: x`（run_docker 的
      `_losses_from_text` 认这个格式）和 `[rt-metric]`。
   2. 传进 train_step 的 `forward_backward_func`：包一层，量 **PP 窗口**
-     （一次流水线 forward+backward 的 GPU 事件跨度）。
+     （一次流水线 forward+backward 的墙钟跨度）。
   3. `_ParamAndGradBucketGroup.start_grad_sync/finish_grad_sync`：量 **DP 窗口**
-     （第一笔 DP 集合通信入队 → 这笔通信真正完成），并累计本步 DP 负载字节。
+     （第一笔 DP 集合通信开始 → 最后一笔真正完成），并累计本步 DP 负载字节。
+
+**一律用 time.perf_counter() 墙钟，不用 cudaEvent。** 这版 Corex 栈上
+cudaEvent.elapsed_time() 对「CPU 阻塞等同步 NCCL」这一段量出来恒为 0：
+2026-11-05 实测一次 4.083GB 的 DP all-reduce kernel 跑了 253.79s（profiler 证据），
+event 对之间仍是 0.00ms，于是 dp_sync_ms=0、重叠率被算成 80~100% 的假值。
 
 指标定义（与 polar 对齐，另外补了一个「串行段」修正）：
 
-  pp_ms         = PP 窗口的 GPU 事件跨度。
-  dp_ms         = DP 窗口的 GPU 事件跨度。
+  pp_start_ms / pp_end_ms = PP 窗口开始/结束，相对本步起点的毫秒偏移。
+  dp_start_ms / dp_end_ms = DP 梯度同步开始/结束，同一时钟、同样相对本步起点。
+  pp_ms         = PP 窗口跨度（= pp_end_ms − pp_start_ms）。
+  dp_ms         = DP 窗口跨度（= dp_end_ms − dp_start_ms）。
+  dp_sync_ms    = 同步路径上 CPU 真正被阻塞的总时长。
   dp_pp_overlap = 被计算真正掩盖掉的 DP 时间 / dp_ms。
 
 重叠率的算法：Megatron 不开 `--overlap-grad-reduce` 时，all-reduce 是在**计算流上
@@ -64,20 +72,19 @@ def _log(msg):
 class _IterState:
     """一次 train_step 的计时状态（每条 rank 自己的，不跨 rank）。"""
 
-    __slots__ = ("step", "t0", "t1", "pp_start", "pp_end", "dp_start", "dp_end",
-                 "call_start", "call_end", "dp_open", "dp_done", "dp_bytes",
-                 "sync_ms", "pp_seen")
+    __slots__ = ("step", "w0", "w1", "pp_w0", "pp_w1", "dp_w0", "dp_w1",
+                 "call_w0", "dp_open", "dp_done", "dp_bytes", "sync_ms", "pp_seen")
 
-    def __init__(self, step, torch):
+    def __init__(self, step):
+        # 全部墙钟：见文件头，cudaEvent 在这版 Corex 上量不出同步 NCCL 的耗时。
         self.step = step
-        self.t0 = torch.cuda.Event(enable_timing=True)
-        self.t1 = torch.cuda.Event(enable_timing=True)
-        self.pp_start = torch.cuda.Event(enable_timing=True)
-        self.pp_end = torch.cuda.Event(enable_timing=True)
-        self.dp_start = torch.cuda.Event(enable_timing=True)
-        self.dp_end = torch.cuda.Event(enable_timing=True)
-        self.call_start = torch.cuda.Event(enable_timing=True)
-        self.call_end = torch.cuda.Event(enable_timing=True)
+        self.w0 = time.perf_counter()
+        self.w1 = None
+        self.pp_w0 = None
+        self.pp_w1 = None
+        self.dp_w0 = None
+        self.dp_w1 = None
+        self.call_w0 = None
         self.dp_open = False
         self.dp_done = False
         self.dp_bytes = 0
@@ -107,25 +114,28 @@ class Probe:
 
         def start_grad_sync(self_grp, *args, **kwargs):
             st = probe.state
-            if st is not None and not st.dp_open:
-                st.dp_open = True
-                st.dp_start.record()
-                try:
-                    st.dp_bytes += sum(
-                        int(b.grad_data.numel()) * int(b.grad_data.element_size())
-                        for b in self_grp.buckets
-                    )
-                except Exception:                             # noqa: BLE001
-                    pass
             if st is not None:
-                st.call_start.record()
+                if st.dp_w0 is None:
+                    st.dp_w0 = time.perf_counter()      # DP 窗口开始
+                st.call_w0 = time.perf_counter()
+                if not st.dp_open:
+                    st.dp_open = True
+                    try:
+                        st.dp_bytes += sum(
+                            int(b.grad_data.numel()) * int(b.grad_data.element_size())
+                            for b in self_grp.buckets
+                        )
+                    except Exception:                         # noqa: BLE001
+                        pass
             try:
                 return orig_start(self_grp, *args, **kwargs)
             finally:
-                # grad_reduce_handle 为 None ⇒ 这次是同步调用，通信在这里已经做完。
+                # grad_reduce_handle 为 None ⇒ 同步调用，CPU 在这里被阻塞到通信做完，
+                # 墙钟差就是这笔 all-reduce 的真实耗时。
                 if st is not None and getattr(self_grp, "grad_reduce_handle", None) is None:
-                    st.call_end.record()
-                    probe._close_dp(st, sync=True)
+                    if st.call_w0 is not None:
+                        st.sync_ms += (time.perf_counter() - st.call_w0) * 1e3
+                    probe._close_dp(st, sync=False)
 
         def finish_grad_sync(self_grp, *args, **kwargs):
             try:
@@ -142,17 +152,16 @@ class Probe:
         def train_step(forward_step_func, data_iterator, model, optimizer,
                        opt_param_scheduler, config, forward_backward_func):
             probe.step += 1
-            st = _IterState(probe.step, torch)
+            st = _IterState(probe.step)
             probe.state = st
-            st.t0.record()
 
             def timed_forward_backward(**kw):
-                st.pp_start.record()
+                st.pp_w0 = time.perf_counter()      # PP 窗口开始
                 st.pp_seen = True
                 try:
                     return forward_backward_func(**kw)
                 finally:
-                    st.pp_end.record()
+                    st.pp_w1 = time.perf_counter()  # PP 窗口结束
 
             try:
                 out = orig_train_step(
@@ -165,7 +174,7 @@ class Probe:
                     forward_backward_func=timed_forward_backward,
                 )
             finally:
-                st.t1.record()
+                st.w1 = time.perf_counter()
                 probe._close_dp(st, sync=False)
                 probe.state = None
             try:
@@ -179,25 +188,21 @@ class Probe:
              f"rank={os.environ.get('RANK', '?')})")
 
     # ------------------------------------------------------------ 采集
-    def _close_dp(self, st, *, sync):
-        if not st.dp_open:
+    def _close_dp(self, st, sync=False):
+        # DP 窗口 = 第一笔 DP 通信开始 → 最后一笔真正完成；每关一次就更新结束点。
+        if st.dp_w0 is None:
             return
         st.dp_open = False
         st.dp_done = True
-        st.dp_end.record()
-        if sync:
-            try:
-                st.sync_ms += st.call_start.elapsed_time(st.call_end)
-            except Exception:                                 # noqa: BLE001
-                pass
+        st.dp_w1 = time.perf_counter()
 
     def _emit(self, st, out):
-        torch = self.torch
-        torch.cuda.synchronize()
+        pp_ms = (st.pp_w1 - st.pp_w0) * 1e3 if st.pp_seen else None
+        dp_ms = (st.dp_w1 - st.dp_w0) * 1e3 if st.dp_done else None
+        step_ms = ((st.w1 if st.w1 is not None else time.perf_counter()) - st.w0) * 1e3
 
-        pp_ms = st.pp_start.elapsed_time(st.pp_end) if st.pp_seen else None
-        dp_ms = st.dp_start.elapsed_time(st.dp_end) if st.dp_done else None
-        step_ms = st.t0.elapsed_time(st.t1)
+        def offset(t):
+            return f"{(t - st.w0) * 1e3:.1f}" if t is not None else "NA"
 
         overlap_ratio = None
         if pp_ms is not None and dp_ms is not None and dp_ms > 0:
@@ -211,6 +216,11 @@ class Probe:
         if loss is not None:
             parts.append(f"loss={loss:.4f}")
         parts.append(f"step_ms={step_ms:.2f}")
+        # 四个时间点：同一时钟（perf_counter），单位 ms，相对本步起点。
+        parts.append(f"pp_start_ms={offset(st.pp_w0)}")
+        parts.append(f"pp_end_ms={offset(st.pp_w1)}")
+        parts.append(f"dp_start_ms={offset(st.dp_w0)}")
+        parts.append(f"dp_end_ms={offset(st.dp_w1)}")
         if pp_ms is not None:
             parts.append(f"pp_ms={pp_ms:.2f}")
         if dp_ms is not None:

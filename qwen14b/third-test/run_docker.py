@@ -64,6 +64,10 @@ profiler：**无条件关闭**（生成的脚本固定 `--disable-profiler true`
 按「命令行里带 run_qwen14b_polar_dp_pp_tp.py 或 torchrun」精确匹配，先 SIGTERM，
 8 s 后仍在的再 SIGKILL。注意 Corex 上打断在途 NCCL 有 XID 24 风险，这是你要的行为。
 
+部署：本文件放在云侧宿主机 `/data1/tangruijing/third-test/run_docker.py`。
+代码来自镜像内固化的 `/workspace/udtca`（不再依赖 /data 下的仓库副本），
+日志与脚本落到 `/data1/tangruijing/third-test/run_log/xnode_<ts>/`。
+
 用法：
     python3 run_docker.py                      # 我们的方法 polar + Baseline Megatron，各 20 iter
     python3 run_docker.py --only-baseline      # 只跑 Baseline（Megatron），不跑 polar
@@ -96,7 +100,7 @@ from datetime import datetime
 from pathlib import Path
 
 LOCAL_HOST = "local"
-DEFAULT_REPO = "/data/tangruijing/udtca"
+DEFAULT_REPO = "/workspace/udtca"
 ENTRY_SUBPATH = "experiments/qwen14b/run_qwen14b_polar_dp_pp_tp.py"
 
 NODES = {
@@ -157,7 +161,10 @@ METHOD_ARGS = {
 
 MEGATRON_PROBE_SUBPATH = "udtca-config/qwen14b/third-test/megatron/megatron_probe.py"
 MEGATRON_PREPARE_SUBPATH = "udtca-config/qwen14b/third-test/megatron/prepare_data.py"
-DEFAULT_MEGATRON_RUNTIME = "/data1/tangruijing/megatron-runtime"
+DEFAULT_MEGATRON_RUNTIME = "/workspace/megatron-runtime"
+# run_log 不放进镜像：代码在镜像里是冻结的，日志/脚本落到宿主机的
+# /data1/tangruijing/third-test/run_log（容器内是同一份，因为 /data 是 bind mount）。
+DEFAULT_RUN_ROOT = "/data/tangruijing/third-test/run_log"
 # 真实数据：和 polar 同一份语料（HuggingFaceFW/fineweb sample-10BT），
 # prepare_data.py 用 datasets 流式下载、再用 Megatron 的 tools/preprocess_data.py 切成 bin/idx。
 DEFAULT_MEGATRON_DATA_DIR = "/data1/tangruijing/megatron-data/fineweb_sample-10BT"
@@ -192,6 +199,8 @@ export PYTHONPATH="$MG_RUNTIME:$(dirname "$PROBE"):/usr/local/corex/lib64/python
 # ---- 通信（同 polar 脚本）----
 export NCCL_IB_DISABLE=1
 export NCCL_SOCKET_IFNAME=@@ifname@@
+export GLOO_SOCKET_IFNAME=@@ifname@@
+[ -n "@@gpu_ids@@" ] && export CUDA_VISIBLE_DEVICES=@@gpu_ids@@
 export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
 export NCCL_SOCKET_RETRY_CNT="${NCCL_SOCKET_RETRY_CNT:-600}"
 export NCCL_SOCKET_RETRY_SLEEP_MSEC="${NCCL_SOCKET_RETRY_SLEEP_MSEC:-1000}"
@@ -320,6 +329,8 @@ export PYTHONPATH=/usr/local/corex/lib64/python3/dist-packages
 # ---- 通信（与 cloud/run_xnode.sh、成功 run 的 PRE_RUN 一致）----
 export NCCL_IB_DISABLE=1
 export NCCL_SOCKET_IFNAME=@@ifname@@
+export GLOO_SOCKET_IFNAME=@@ifname@@
+[ -n "@@gpu_ids@@" ] && export CUDA_VISIBLE_DEVICES=@@gpu_ids@@
 export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
 export NCCL_SOCKET_RETRY_CNT="${NCCL_SOCKET_RETRY_CNT:-600}"
 export NCCL_SOCKET_RETRY_SLEEP_MSEC="${NCCL_SOCKET_RETRY_SLEEP_MSEC:-1000}"
@@ -497,6 +508,7 @@ def _megatron_build_values(rank, args, case_dir, ts):
         "master_addr": NODES[0]["ip"],
         "master_port": args.master_port,
         "gpus": args.gpus,
+        "gpu_ids": getattr(args, "gpu_ids", "") or "",
         "pp": args.pp,
         "tp": args.tp,
         "dp": dp,
@@ -553,6 +565,7 @@ def build_script(mode, rank, args, case_dir, ts):
         "master_addr": NODES[0]["ip"],
         "master_port": args.master_port,
         "gpus": args.gpus,
+        "gpu_ids": getattr(args, "gpu_ids", "") or "",
         "pp": args.pp,
         "tp": args.tp,
         "max_steps": args.max_steps,
@@ -756,8 +769,8 @@ def preflight(args):
                                                    f"&& echo ok"))
         check(f"node{rank} 容器里 run_log 可写",
               _docker(node["host"], args.container,
-                      f"touch {args.repo}/run_log/.preflight && rm -f "
-                      f"{args.repo}/run_log/.preflight && echo ok"))
+                      f"mkdir -p {args.run_root} && touch {args.run_root}/.preflight && rm -f "
+                      f"{args.run_root}/.preflight && echo ok"))
         check(f"node{rank} 容器里能看到 {args.gpus} 张卡",
               _docker(node["host"], args.container,
                       f"test $(ls /dev/ix* 2>/dev/null | wc -l) -ge {args.gpus} "
@@ -1853,7 +1866,9 @@ def make_arg_parser():
                    help="只跑 Baseline（megatron）、不跑 polar（等价于 --modes megatron，"
                         "二者同时给出时以本参数为准）")
     p.add_argument("--repo", default=DEFAULT_REPO, help="两台机器上相同的仓库根路径")
-    p.add_argument("--container", default="trj-udtca")
+    p.add_argument("--container", default="third-test")
+    p.add_argument("--run-root", default=DEFAULT_RUN_ROOT,
+                   help=f"日志/脚本落盘根目录（宿主机与容器同一份，默认 {DEFAULT_RUN_ROOT}）")
     p.add_argument("--ssh-target", default=SSH["target"], help="ssh 到 node1 的目标（默认 powerone2）")
     p.add_argument("--ssh-opts", default="",
                    help='ssh 参数（给了就整体替换默认的 "-o BatchMode=yes -o ConnectTimeout=10"），'
@@ -1863,8 +1878,12 @@ def make_arg_parser():
     p.add_argument("--max-steps", type=int, default=20)
     p.add_argument("--micro-batches", type=int, default=16)
     p.add_argument("--seq-len", type=int, default=256)
-    p.add_argument("--gpus", type=int, default=16, help="每台机器的卡数")
-    p.add_argument("--pp", type=int, default=8)
+    p.add_argument("--gpus", type=int, default=8,
+                   help="每台机器的卡数（third-test 默认 8：只用 8-15 这 8 张，其余卡有他人占用或历史故障）")
+    p.add_argument("--gpu-ids", default="8,9,10,11,12,13,14,15",
+                   help="CUDA_VISIBLE_DEVICES 白名单；空=用全部可见卡。"
+                        "默认 8-15（两台机器当前唯一空闲且健康的一组）")
+    p.add_argument("--pp", type=int, default=4, help="默认 4：配 8 卡/节点时 DP=2，正好跨机")
     p.add_argument("--tp", type=int, default=2)
     p.add_argument("--seed", type=int, default=1234)
     # 29630 在 powerone1 上会被 kube-apiserver 的临时端口占用，默认换成两机都空的端口。
@@ -2002,7 +2021,7 @@ def main():
         print(f"训练时加：--megatron-data-path {prefix}")
         return 0
 
-    run_dir = Path(args.repo) / "run_log" / f"xnode_{args._ts}"
+    run_dir = Path(args.run_root) / f"xnode_{args._ts}"
     if not args.dry_run:
         # 从这一行起，所有 stdout/stderr（含后面两机 torchrun 的实时输出、汇总、
         # 分析）都同时写进 run_dir/run_docker.stdout.log；不再依赖调用方把

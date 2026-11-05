@@ -1,0 +1,27 @@
+# third-test 云侧（powerone1 / 10.205.200.14）冻结镜像
+#
+# 基础镜像与当前在跑的容器完全一致；代码与 Megatron 运行时打进镜像，
+# 运行期不再依赖 /data 下的仓库副本（日志仍落 /data1/tangruijing/third-test/run_log）。
+#
+#   docker build -t udtca-third-test:cloud-20261105 \
+#       -f /data1/tangruijing/third-test/build/Dockerfile.cloud \
+#       /data1/tangruijing/third-test/build
+FROM corex:4.5.0.20261008-ubuntu22.04-llm-py3.12-v2
+
+LABEL udtca.third-test.role="cloud"
+LABEL udtca.third-test.host="powerone1"
+LABEL udtca.third-test.frozen="20261105"
+LABEL udtca.third-test.repo="/workspace/udtca"
+LABEL udtca.third-test.megatron="/workspace/megatron-runtime"
+
+COPY ctx/udtca            /workspace/udtca
+COPY ctx/megatron-runtime /workspace/megatron-runtime
+
+# 冻结时两机逐文件 md5，供事后核对
+COPY udtca_manifest.txt    /workspace/udtca_manifest.txt
+COPY megatron_manifest.txt /workspace/megatron_manifest.txt
+
+# /data1 是代码里的另一种写法；运行期 /data 会 bind mount 进来
+RUN mkdir -p /workspace/udtca/run_log && ln -sfn /data /data1
+
+WORKDIR /workspace/udtca
