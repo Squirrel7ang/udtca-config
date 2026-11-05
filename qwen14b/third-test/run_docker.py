@@ -165,12 +165,12 @@ DEFAULT_MEGATRON_RUNTIME = "/workspace/megatron-runtime"
 # run_log 不放进镜像：代码在镜像里是冻结的，日志/脚本落到宿主机的
 # /data1/tangruijing/third-test/run_log（容器内是同一份，因为 /data 是 bind mount）。
 DEFAULT_RUN_ROOT = "/data/tangruijing/third-test/run_log"
-# 真实数据：和 polar 同一份语料（HuggingFaceFW/fineweb sample-10BT），
-# prepare_data.py 用 datasets 流式下载、再用 Megatron 的 tools/preprocess_data.py 切成 bin/idx。
+# 真实数据：和 polar 同一份语料（HuggingFaceFW/fineweb sample-10BT）。bin/idx 已经烤进镜像，
+# prepare_data.py 只在 --megatron-force-prepare 时才重新下（datasets 流式下载 + preprocess_data.py）。
 DEFAULT_MEGATRON_DATA_DIR = "/workspace/megatron-data/fineweb_sample-10BT"
 MEGATRON_DATA_PREFIX_NAME = "fineweb_sample-10BT"
-# 用 HF repo id 而不是本地目录：powerone2 上没有 /data1/tangruijing/models，
-# 而 HuggingFaceTokenizer 两边都要能拿到同一份 tokenizer（通过 hf-mirror 拉）。
+# 用 HF repo id：镜像里烤了 Qwen2.5 的 HF 缓存并设了 HF_HOME/HF_HUB_OFFLINE，
+# 两台机器都从各自镜像内的 /workspace/hf-cache 离线解析到同一份 tokenizer。
 DEFAULT_MEGATRON_TOKENIZER = "Qwen/Qwen2.5-14B-Instruct"
 # 镜像里已经烤好 fineweb sample-10BT 的 bin/idx，默认就用真语料（los 与 polar 可比）。
 DEFAULT_MEGATRON_DATA_PATH = f"{DEFAULT_MEGATRON_DATA_DIR}/{MEGATRON_DATA_PREFIX_NAME}_text_document"
@@ -758,8 +758,7 @@ def preflight(args):
         print("  [FAIL] 宿主机没有 docker 命令")
         print("\n这个脚本要在 powerone1 的**宿主机**上跑，不能在容器里跑：")
         print("  容器内没有 docker / /var/run/docker.sock，无法启动 node0，也起不了 node1。")
-        print("  请在宿主机上执行：cd /data1/tangruijing/udtca/udtca-config/qwen14b && "
-              "python3 run_docker.py")
+        print("  请在宿主机上执行：python3 /data1/tangruijing/third-test/run_docker.py")
         return False
 
     for rank in (0, 1):

@@ -1,4 +1,4 @@
-# third-test 边侧（powerone2 / 10.205.200.14）冻结镜像
+# third-test 边侧（powerone2 / 10.205.200.16）冻结镜像
 #
 # 全部依赖都烧进镜像：代码、Megatron 运行时、训练语料、psgd/bitscom 的
 # editable 安装（bitscom 的 C++/CUDA 扩展在构建时按本机编译）。
@@ -14,7 +14,9 @@ LABEL udtca.third-test.host="powerone2"
 LABEL udtca.third-test.frozen="20261105"
 
 ENV COREX_PATH=/usr/local/corex \
-    CUDA_HOME=/usr/local/corex
+    CUDA_HOME=/usr/local/corex \
+    NCCL_LIB_DIR=/usr/local/corex/lib64 \
+    LD_LIBRARY_PATH=/usr/local/corex/lib64:/usr/local/lib
 
 # 边侧专属：替换 Corex 运行时库（与当前在跑的容器用同一份文件）
 COPY ctx/docker_libs/libcuda_a.so.1 /usr/local/corex/lib64/libcuda.so.1
@@ -28,12 +30,29 @@ COPY ctx/megatron-data    /workspace/megatron-data
 
 COPY udtca_manifest.txt    /workspace/udtca_manifest.txt
 COPY megatron_manifest.txt /workspace/megatron_manifest.txt
+COPY megatron_data_manifest.txt /workspace/megatron_data_manifest.txt
+
+# 基础镜像里缺的运行时依赖（版本与 trj-udtca 现役容器一致；
+# pyarrow 必须 <=18：19+ 要 numpy>=2，而基础镜像是 numpy 1.26.4）
+RUN pip install --no-cache-dir tensorboard==2.21.0 datasets==3.2.0 pyarrow==18.1.0 \
+ && python -c "import tensorboard, datasets, pyarrow; \
+print('tensorboard:', tensorboard.__version__, 'datasets:', datasets.__version__, 'pyarrow:', pyarrow.__version__)"
 
 # editable 安装：往 site-packages 写 __editable__.psgd / __editable__.bitscom 的 .pth，
 # 指向 /workspace/udtca/{polar-sgd/src,bitscom/python}。bitscom 在这里按本机编译。
-RUN pip install --no-build-isolation --no-index -e /workspace/udtca/polar-sgd \
- && pip install --no-build-isolation --no-index -e /workspace/udtca/bitscom \
- && python -c "import psgd, bitscom; print('psgd:', psgd.__file__); print('bitscom:', bitscom.__file__)"
+# --no-deps：torch/transformers/sentencepiece 基础镜像已有，datasets 上面刚装；
+# psgd 声明里的多数依赖并不在 import 路径上，避免去索引里解析版本。
+RUN pip install --no-build-isolation --no-index --no-deps -e /workspace/udtca/polar-sgd \
+ && pip install --no-build-isolation --no-index --no-deps -e /workspace/udtca/bitscom \
+ && python -c "import psgd, bitscom; \
+print('psgd:', psgd.__file__); print('bitscom:', bitscom.__file__)"
+
+# Qwen2.5 tokenizer 的 HF 缓存（Megatron 的 HuggingFaceTokenizer 要用）：
+# 烤进镜像 + 关掉联网解析，运行期不依赖宿主机的 ~/.cache/huggingface 或 hf-mirror。
+COPY ctx/hf-cache /workspace/hf-cache
+ENV HF_HOME=/workspace/hf-cache \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
 
 RUN chmod 755 /usr/local/corex/bin/ixsmi && mkdir -p /workspace/udtca/run_log && ln -sfn /data /data1
 
