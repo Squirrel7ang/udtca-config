@@ -10,6 +10,7 @@ docker rm -f third-test 2>/dev/null || true
 docker run -d --name third-test \
   --privileged --cap-add ALL \
   --network host --ipc host \
+  --ulimit memlock=-1:-1 --ulimit stack=67108864:67108864 \
   --restart unless-stopped \
   -v /dev:/dev \
   -v /lib/modules:/lib/modules \
