@@ -5,9 +5,14 @@
   * node0 = 本机，宿主机执行 `docker exec trj-udtca ...`
   * node1 = powerone2，宿主机执行 `ssh <node1> 'docker exec trj-udtca ...'`
 
-third-test 只有两项对比：**我们的方法（polar）** 和 **Baseline（Megatron）**，
-默认就是这两个 mode（polar 先、Megatron 后）。旧的 torch-DDP baseline 不再参与
-third-test，需要时显式 `--modes baseline`。
+third-test 的入口一共三个脚本，分工固定：
+
+  * `run_api.py`       —— 在上面两个脚本之上挂实时指标 API（默认只跑 polar）
+  * `run_docker.py`    —— 本文件：**polar vs polar 的 baseline（torch DDP）**，默认 20 iter
+  * `run_megatron.py`  —— polar vs **Megatron-Core baseline**，默认 10 iter（复用本文件的实现）
+
+本文件默认只跑 `--modes polar,baseline`，不再跑 Megatron；要看 Megatron baseline
+用同目录的 `run_megatron.py`（它就是本文件 + 改默认值，实现只有这一份，不会漂）。
 
 每个 mode 跑之前都先过一道卡检查（见 card_precheck）：
   * 占用：两台节点容器里 `ixsmi --query-gpu/--query-compute-apps`，有人在用就不启动
@@ -69,18 +74,21 @@ profiler：**无条件关闭**（生成的脚本固定 `--disable-profiler true`
 日志与脚本落到 `/data1/tangruijing/third-test/run_log/xnode_<ts>/`。
 
 用法：
-    python3 run_docker.py                      # 我们的方法 polar + Baseline Megatron，各 20 iter
-    python3 run_docker.py --only-baseline      # 只跑 Baseline（Megatron），不跑 polar
+    python3 run_docker.py                      # 我们的方法 polar + polar 的 baseline（torch DDP），各 20 iter
+    python3 run_docker.py --only-baseline      # 只跑 baseline（torch DDP），不跑 polar
     python3 run_docker.py --modes polar        # 只跑 polar
-    python3 run_docker.py --modes baseline     # 旧 torch-DDP baseline（不属于 third-test）
-    python3 run_docker.py --megatron-prepare-data   # 两机各抓一次 fineweb sample-10BT → bin/idx
-    python3 run_docker.py --megatron-data-path <prefix>   # Megatron 改用真实数据（默认 mock）
     python3 run_docker.py --max-steps 10       # 每个 mode 跑 10 iter
     python3 run_docker.py --max-steps 3        # 冒烟
     python3 run_docker.py --dry-run            # 只打印生成的脚本，什么都不启动
     python3 run_docker.py --save-weights --max-steps 5   # 跑完存权重（默认 <repo>/checkpoints/xnode）
     python3 run_docker.py --preflight-only     # 只检查两台机器/容器/ssh/卡占用/卡健康
     python3 run_docker.py --skip-card-check    # 卡检查有历史日志噪音时临时跳过
+
+Megatron baseline 见 run_megatron.py（默认 polar,megatron，10 iter，数据集缓存自动预热）：
+    python3 run_megatron.py                            # polar + Megatron，各 10 iter
+    python3 run_megatron.py --only-baseline            # 只跑 Megatron
+    python3 run_megatron.py --megatron-prepare-data    # 两机各抓一次 fineweb sample-10BT → bin/idx
+    python3 run_megatron.py --megatron-data-path <prefix>  # Megatron 用真实数据（默认 mock）
 """
 
 import argparse
@@ -478,6 +486,106 @@ def _megatron_data_label(args):
     return f"real fineweb sample-10BT（与 polar 同语料）: {prefix}"
 
 
+MEGATRON_CACHE_WARM_SNIPPET = r'''
+import os, sys
+
+TRAIN_ITERS = int(os.environ["WARM_TRAIN_ITERS"])
+GBS = int(os.environ["WARM_GBS"])
+SEQ_LEN = int(os.environ["WARM_SEQ_LEN"])
+EVAL_ITERS = int(os.environ["WARM_EVAL_ITERS"])
+EVAL_INTERVAL = int(os.environ["WARM_EVAL_INTERVAL"])
+SEED = int(os.environ["WARM_SEED"])
+DATA_PATH = os.environ["WARM_DATA_PATH"]
+DATA_CACHE = os.environ["WARM_DATA_CACHE"]
+
+sys.argv = [
+    "pretrain_gpt.py",
+    "--num-layers", "48",
+    "--hidden-size", "5120",
+    "--num-attention-heads", "40",
+    "--seq-length", str(SEQ_LEN),
+    "--micro-batch-size", "1",
+    "--global-batch-size", str(GBS),
+    "--train-iters", str(TRAIN_ITERS),
+    "--eval-iters", str(EVAL_ITERS),
+    "--eval-interval", str(EVAL_INTERVAL),
+    "--seed", str(SEED),
+    "--data-path", DATA_PATH,
+    "--data-cache-path", DATA_CACHE,
+    "--tokenizer-type", "NullTokenizer",
+    "--vocab-size", "152064",
+    "--split", "969, 30, 1",   # validate_args 的默认值，这里跳过 validate 必须显式给
+]
+
+from megatron.training.arguments import parse_args
+
+args = parse_args()
+import pretrain_gpt
+from megatron.core.datasets.blended_megatron_dataset_builder import (
+    BlendedMegatronDatasetBuilder,
+)
+from megatron.core.datasets.gpt_dataset import GPTDataset
+
+config = pretrain_gpt.core_gpt_dataset_config_from_args(args)
+sizes = (
+    args.train_iters * args.global_batch_size,
+    (args.train_iters // args.eval_interval + 1) * args.eval_iters * args.global_batch_size,
+    args.eval_iters * args.global_batch_size,
+)
+print("sizes (train/valid/test):", sizes)
+# 单进程、且不初始化 torch.distributed：builder 不会短路，一定会在这里构建并落盘
+BlendedMegatronDatasetBuilder(GPTDataset, sizes, lambda *a, **k: True, config).build()
+print("cache files:", sorted(f for f in os.listdir(DATA_CACHE) if f.endswith(".npy")))
+'''
+
+
+def warm_megatron_index_cache(args):
+    """两台机器各自单进程预构建一次 GPTDataset 索引缓存。
+
+    Megatron 只在 global rank 0 先建、其余 building rank 等 barrier 后再建
+    （blended_megatron_dataset_builder.py:501-517），前提是 path_to_cache 是共享盘。
+    这里是两台机器各自的本地目录：node0 建完 node1 读不到，node1 的两个 building
+    rank（first/last pipeline stage × tp0）会同时重建同一份索引，
+    抢跑的 rank 看到 description.txt 就去 load 还没写完的 .npy → FileNotFoundError。
+    起训前各建一次，正式跑时所有 rank 都是 cache_hit，既不跨机依赖也不会并发写。
+    """
+    if getattr(args, "skip_megatron_cache_warm", False):
+        print("\n[缓存预热] 已按 --skip-megatron-cache-warm 跳过")
+        return True
+    data_path = _megatron_data_prefix(args)
+    if not data_path:
+        print("\n[缓存预热] --mock-data，不涉及索引缓存，跳过")
+        return True
+
+    dp, gbs = _megatron_dp_gbs(args)
+    env = (
+        "export COREX_PATH=/usr/local/corex CUDA_HOME=/usr/local/corex "
+        "PATH=/usr/local/corex/bin:/usr/local/corex/lib64/python3/dist-packages/bin:$PATH "
+        "LD_LIBRARY_PATH=/usr/local/corex/lib64:/usr/local/openmpi/lib:/usr/local/lib "
+        f"PYTHONPATH={args.megatron_runtime}:/usr/local/corex/lib64/python3/dist-packages "
+        "PYTHONUNBUFFERED=1 OMP_NUM_THREADS=4; "
+        f"export WARM_TRAIN_ITERS={args.max_steps} WARM_GBS={gbs} WARM_SEQ_LEN={args.seq_len} "
+        f"WARM_EVAL_ITERS=0 WARM_EVAL_INTERVAL=1000 WARM_SEED={args.seed} "
+        f"WARM_DATA_PATH={shlex.quote(data_path)} "
+        f"WARM_DATA_CACHE={shlex.quote(_megatron_data_cache(args))}; "
+        "python -"
+    )
+    print(f"\n[缓存预热] 两机各跑一次（单进程，train={args.max_steps}×{gbs}={args.max_steps * gbs}）…")
+    for rank in (0, 1):
+        node = NODES[rank]
+        argv = _on(node["host"], f"docker exec -i {args.container} bash -c {shlex.quote(env)}")
+        out = subprocess.run(argv, input=MEGATRON_CACHE_WARM_SNIPPET, capture_output=True,
+                             text=True, timeout=1800)
+        for line in (out.stdout or "").strip().splitlines()[-3:]:
+            print(f"    {node['name']:10s} {line}")
+        if out.returncode != 0:
+            print(f"    {node['name']} 缓存预热失败（rc={out.returncode}），最后几行：")
+            for line in (out.stderr or "").strip().splitlines()[-10:]:
+                print(f"    {node['name']:10s} {line}")
+            return False
+    return True
+
+
 def prepare_megatron_data(args):
     """两台机器各跑一次 prepare_data.py，把 fineweb 抓成 Megatron 的 bin/idx。"""
     script = f"{args.repo}/{MEGATRON_PREPARE_SUBPATH}"
@@ -503,10 +611,15 @@ def prepare_megatron_data(args):
         subprocess.run(_docker(node["host"], args.container, cmd), check=True)
 
 
+def _megatron_dp_gbs(args):
+    """DP 永远是跨机那一路；gbs = micro_batches × DP（索引缓存的 num_samples 由它决定）。"""
+    dp = max((2 * args.gpus) // max(args.pp * args.tp, 1), 1)
+    return dp, args.micro_batches * dp
+
+
 def _megatron_build_values(rank, args, case_dir, ts):
     """Megatron mode 的占位符取值（DP 永远是跨机那一路：--use-tp-pp-dp-mapping）。"""
-    dp = max((2 * args.gpus) // max(args.pp * args.tp, 1), 1)
-    gbs = args.micro_batches * dp
+    dp, gbs = _megatron_dp_gbs(args)
     dist_opt = list(getattr(args, "megatron_dist_opt_args", []) or [])
     extra = shlex.split(getattr(args, "megatron_extra_args", "") or "")
     return {
@@ -1624,6 +1737,13 @@ def run_mode(mode, args, run_dir):
 
     started = time.time()
 
+    if mode == "megatron" and not warm_megatron_index_cache(args):
+        print("    索引缓存预热失败，本 mode 不启动（正式跑会撞 FileNotFoundError）。")
+        return {"mode": mode, "case_dir": str(mode_dir), "started": started,
+                "elapsed_s": 0.0, "exit0": "not-started", "exit1": "not-started",
+                "node0": str(mode_dir / "node0"), "node1": str(mode_dir / "node1"),
+                "nets": {}, "timed_out": False, "warm_failed": True}
+
     # 跨机网卡计数器 1 Hz 采样，从起跑一直采到两机收尾；训练期间的数据都在里面
     # （含启动/NCCL 建连那几十秒，单步均摊时按步数摊掉）。
     net_procs = {rank: start_net_sampler(rank, mode_dir / f"net_node{rank}.csv")
@@ -1793,10 +1913,10 @@ def compare(rows):
     by = {r["mode"]: r for r in rows}
     b, m = by.get("baseline"), by.get("polar")
     out = []
-    # 旧的 torch-DDP baseline 不再属于 third-test 的两项对比，只有显式 --modes baseline
-    # 跑到时才附在后面。
+    # run_docker.py 的主对比：polar vs torch-DDP baseline（两者都跑时才出这一段）
     if b:
-        out.append("—— 附：旧 torch-DDP baseline vs polar（不属于 third-test 口径）——")
+        out.append("—— 我们的方法（polar） vs Baseline（torch DDP）——")
+        out.append("  同模型/同全局 batch/同 PP-TP 切分，DP 走跨机普通 DDP（基线不做任何通信优化）")
     if b and m and b.get("elapsed_s") and m.get("elapsed_s"):
         out.append(f"端到端 baseline={b['elapsed_s']:.1f}s  polar={m['elapsed_s']:.1f}s  "
                    f"加速={b['elapsed_s'] / m['elapsed_s']:.2f}x"
@@ -1876,18 +1996,21 @@ def compare(rows):
 
 # ---------------------------------------------------------------- main
 
-def make_arg_parser():
+def make_arg_parser(default_modes="polar,baseline", default_max_steps=20,
+                    baseline_mode="baseline"):
+    base_label = "Megatron" if baseline_mode == "megatron" else "torch DDP"
     p = argparse.ArgumentParser(
-        description="跨机 Qwen14B：[我们的方法 polar] vs [Baseline = Megatron] 性能对比"
+        description=f"跨机 Qwen14B：[我们的方法 polar] vs [Baseline = {base_label}] 性能对比"
                     "（默认不开 profiler）+ 自动分析",
         epilog="必须在 powerone1 的宿主机上运行（容器里没有 docker）。")
     p.add_argument("--modes", default=None,
-                   help="逗号分隔，可选 polar|megatron（按顺序跑；不写则默认 polar,megatron）。"
-                        "baseline|polar_dense|bitscom 仍保留，但已不属于 third-test 的两项对比，"
+                   help=f"逗号分隔，可选 polar|{baseline_mode}（按顺序跑；"
+                        f"不写则默认 {default_modes}）。"
+                        "polar_dense|bitscom 仍保留，但已不属于 third-test 的对比，"
                         "需要时显式指定")
     p.add_argument("--only-baseline", action="store_true",
-                   help="只跑 Baseline（megatron）、不跑 polar（等价于 --modes megatron，"
-                        "二者同时给出时以本参数为准）")
+                   help=f"只跑 Baseline（{baseline_mode}）、不跑 polar"
+                        f"（等价于 --modes {baseline_mode}，二者同时给出时以本参数为准）")
     p.add_argument("--repo", default=DEFAULT_REPO, help="两台机器上相同的仓库根路径")
     p.add_argument("--container", default="third-test")
     p.add_argument("--run-root", default=DEFAULT_RUN_ROOT,
@@ -1896,9 +2019,10 @@ def make_arg_parser():
     p.add_argument("--ssh-opts", default="",
                    help='ssh 参数（给了就整体替换默认的 "-o BatchMode=yes -o ConnectTimeout=10"），'
                         '如 "-p 7122 -i /root/.ssh/id_rsa"')
-    # third-test 这一份默认跑 20 步：端到端加速比里固定开销（模型构建/NCCL 建连 ≈260 s）
-    # 占比太大，5 步不足以体现真实加速；qwen14b/run_docker.py 那份仍是 5。
-    p.add_argument("--max-steps", type=int, default=20)
+    # 两个入口脚本共用这一份实现，只有默认值不同：
+    #   run_docker.py   -> polar,baseline（torch DDP），20 iter
+    #   run_megatron.py -> polar,megatron，10 iter
+    p.add_argument("--max-steps", type=int, default=default_max_steps)
     p.add_argument("--micro-batches", type=int, default=16)
     p.add_argument("--seq-len", type=int, default=256)
     p.add_argument("--gpus", type=int, default=16, help="每台机器的卡数")
@@ -1931,6 +2055,10 @@ def make_arg_parser():
     p.add_argument("--megatron-data-path", default=DEFAULT_MEGATRON_DATA_PATH,
                    help="Megatron 预训练数据的 --data-path 前缀（不带 _text_document.bin），"
                         "两台机器路径相同、各自本地。不写则用 --mock-data")
+    p.add_argument("--skip-megatron-cache-warm", action="store_true",
+                   help="跳过起训前的 GPTDataset 索引缓存预热。默认会在两台机器上各单进程预建一次："
+                        "缓存目录是两台各自的本地盘，只有 global rank 0 建的会被另一台读不到，"
+                        "node1 的 building rank 会并发重建同一份索引并撞 FileNotFoundError")
     p.add_argument("--megatron-data-dir", default=DEFAULT_MEGATRON_DATA_DIR,
                    help=f"prepare_data.py 的输出目录 / data-cache 位置（默认 {DEFAULT_MEGATRON_DATA_DIR}）")
     p.add_argument("--megatron-tokenizer", default=DEFAULT_MEGATRON_TOKENIZER,
@@ -2003,8 +2131,8 @@ def _install_stdout_log(run_dir):
     return log_file
 
 
-def main():
-    args = make_arg_parser().parse_args()
+def main(default_modes="polar,baseline", default_max_steps=20, baseline_mode="baseline"):
+    args = make_arg_parser(default_modes, default_max_steps, baseline_mode).parse_args()
     if args.save_weights and not args.save_dir:
         args.save_dir = f"{args.repo}/checkpoints/xnode"
     args.megatron_dist_opt_args = (
@@ -2021,18 +2149,20 @@ def main():
         NET_IF[1] = args.net_if1
 
     if args.only_baseline:
-        if args.modes and [m.strip() for m in args.modes.split(",") if m.strip()] != ["megatron"]:
+        if args.modes and [m.strip() for m in args.modes.split(",") if m.strip()] != [baseline_mode]:
             print(f"--only-baseline 与 --modes {args.modes} 同时给出，以 --only-baseline 为准"
-                  "（只跑 baseline = Megatron）", file=sys.stderr)
-        modes = ["megatron"]
+                  f"（只跑 baseline = {baseline_mode}）", file=sys.stderr)
+        modes = [baseline_mode]
     else:
-        # third-test 的对比口径：我们的方法（polar）vs Baseline（Megatron）。
-        # 旧的 torch-DDP baseline 不参与 third-test；确实要看时显式 --modes baseline。
-        modes = [m.strip() for m in (args.modes or "polar,megatron").split(",") if m.strip()]
+        modes = [m.strip() for m in (args.modes or default_modes).split(",") if m.strip()]
     for m in modes:
         if m not in METHOD_ARGS:
             print(f"未知 mode: {m}", file=sys.stderr)
             return 2
+    if "megatron" in modes and baseline_mode != "megatron":
+        print("Megatron baseline 属于 run_megatron.py 的活：本脚本只跑 polar 和 torch-DDP baseline。\n"
+              "  python3 run_megatron.py --modes polar,megatron", file=sys.stderr)
+        return 2
 
     if args.megatron_prepare_data:
         prepare_megatron_data(args)
@@ -2085,8 +2215,11 @@ def main():
                 break
             _STATE["active"] = True
             rec = run_mode(mode, args, run_dir)
-            rows.append(collect(rec, args))
             _STATE["active"] = False
+            if rec.get("warm_failed"):
+                print("\nMegatron 索引缓存预热失败，后续 mode 不再启动。")
+                break
+            rows.append(collect(rec, args))
     except BaseException as exc:                               # noqa: BLE001
         _STATE["active"] = False
         cleanup_nodes(args, f"异常 {exc.__class__.__name__}: {exc}")

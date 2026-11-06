@@ -15,7 +15,8 @@
 两件事：
 
 1. **启动训练**：把同目录的 run_docker.py 作为子进程拉起（默认只跑
-   `--modes polar`，要 baseline 显式传 `--modes polar,baseline`）；它的 stdout 会实时回显，同时由 run_docker 自己
+   `--modes polar`；要 polar vs baseline 传 `--modes polar,baseline` 或直接跑 run_docker.py，
+   要看 Megatron baseline 用 `--docker-script .../run_megatron.py --modes polar,megatron`）。它的 stdout 会实时回显，同时由 run_docker 自己
    tee 到 `<run_dir>/run_docker.stdout.log`。
 2. **实时输出重叠率 / 压缩量**：run_docker 的产物是
    `run_log/xnode_<ts>/<mode>/node{0,1}/train.log`，而 metrics_api 只认
@@ -254,13 +255,16 @@ def make_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-training", action="store_true",
                    help="不起训练，只把 API 挂到已有的 xnode run 上")
     p.add_argument("--modes", default="polar",
-                   help="传给 run_docker 的 --modes（默认只跑 polar；要对比再传 polar,baseline）")
+                   help="传给 run_docker/run_megatron 的 --modes（默认只跑 polar；"
+                        "要对比 polar,baseline 或 polar,megatron）")
     p.add_argument("--max-steps", type=int, default=None,
-                   help="传给 run_docker 的 --max-steps")
+                   help="传给 run_docker/run_megatron 的 --max-steps（不写则用对应脚本的默认值："
+                        "run_docker 20、run_megatron 10）")
     p.add_argument("--repo", default=str(REPO_ROOT),
                    help="两台机器上的仓库根路径（传给 run_docker）")
     p.add_argument("--docker-script", default=str(DEFAULT_DOCKER),
-                   help="run_docker.py 的位置")
+                   help="被拉起的入口脚本位置（默认同目录 run_docker.py；"
+                        "要看 Megatron baseline 就指到 run_megatron.py）")
     p.add_argument("--install-deps", action="store_true",
                    help=f"缺依赖时装到 {DEPS_DIR}")
     p.add_argument("docker_args", nargs=argparse.REMAINDER,
