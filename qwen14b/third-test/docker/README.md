@@ -18,14 +18,14 @@ bash /data1/tangruijing/third-test/create_docker.sh
 # 2. 跑训练（三选一，都在云侧宿主机上跑）
 python3 /data1/tangruijing/third-test/run_docker.py     # polar vs polar 的 baseline（torch DDP），各 20 iter
 python3 /data1/tangruijing/third-test/run_megatron.py   # polar vs Megatron-Core baseline，各 10 iter
-python3 /data1/tangruijing/third-test/run_api.py        # 起训练 + 实时指标 API（默认只跑 polar）
+python3 udtca-config/qwen14b/third-test/run_api.py      # 从仓库目录起：训练 + 实时指标 API（默认只跑 polar）
 ```
 
 三个脚本的分工：
 
 | 脚本 | 默认 modes | 默认步数 | 说明 |
 |---|---|---|---|
-| `run_api.py` | polar | 5 | 在 `run_docker.py` 之上挂 `/api/v1/*` 实时指标 API |
+| `run_api.py` | polar | 跟入口脚本（默认 20） | 在 `run_docker.py` 之上挂 `/api/v1/*` 实时指标 API（从仓库目录运行，需 `qwen14b/metrics_api.py`） |
 | `run_docker.py` | `polar,baseline` | 20 | baseline = polar 的 torch-DDP 对照，不跑 Megatron |
 | `run_megatron.py` | `polar,megatron` | 10 | baseline = Megatron-Core；复用 `run_docker.py` 的实现，只是默认值不同 |
 
