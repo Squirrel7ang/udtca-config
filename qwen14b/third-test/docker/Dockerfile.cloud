@@ -54,6 +54,11 @@ print('psgd:', psgd.__file__); print('bitscom:', bitscom.__file__)"
 # HF —— 离线模式下必然失败。缓存文件名带节点标签，所以两台镜像各烤一份。
 COPY ctx/polar-cache /workspace/udtca/experiments/qwen14b/cache
 
+# Megatron 的 GPTDataset 索引缓存：原本运行时由 16 个本地 rank 并发构建，
+# 写 description 与写 .npy 之间有窗口，rank 会读到还没生成的 .npy 而
+# FileNotFoundError。烤进镜像后所有 rank 直接走 load 分支，竞态不存在。
+COPY ctx/megatron-cache /workspace/megatron-data/fineweb_sample-10BT/cache
+
 # Qwen2.5 tokenizer 的 HF 缓存（Megatron 的 HuggingFaceTokenizer 要用）：
 # 烤进镜像 + 关掉联网解析，运行期不依赖宿主机的 ~/.cache/huggingface 或 hf-mirror。
 COPY ctx/hf-cache /workspace/hf-cache

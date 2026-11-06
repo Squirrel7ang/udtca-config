@@ -87,6 +87,11 @@ for pat in ("*.bin", "*.idx"):
     if not got:
         bad("megatron 语料缺 %s" % pat)
 
+mega_cache = glob.glob(os.path.join(data, "cache", "*-GPTDataset-train-document_index.npy"))
+print("  megatron 索引缓存 %s" % (mega_cache or "缺失"))
+if not mega_cache:
+    bad("megatron 索引缓存缺失（多 rank 并发构建会撞 FileNotFoundError）")
+
 polar_cache = glob.glob(
     "/workspace/udtca/experiments/qwen14b/cache/*_seq256_samples*_labels_unshifted_v2.pt")
 print("  polar token 缓存 %s" % (polar_cache or "缺失"))
