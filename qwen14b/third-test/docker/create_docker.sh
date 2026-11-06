@@ -154,6 +154,8 @@ step "完成"
 cat <<MSG
 容器已就绪（云侧/边侧各一台，名字 $CONTAINER）。下一步跑训练：
 
-  python3 $DEPLOY_DIR/run_docker.py                 # polar + megatron 各 20 iter，自动对比
+  python3 $DEPLOY_DIR/run_docker.py                   # polar vs torch-DDP baseline，各 20 iter
+  python3 $DEPLOY_DIR/run_megatron.py                 # polar vs Megatron-Core baseline，各 10 iter
+  python3 $DEPLOY_DIR/run_api.py                      # 起训练 + 实时指标 API（默认只跑 polar）
   python3 $DEPLOY_DIR/run_docker.py --preflight-only  # 只想先查卡/连通性
 MSG
