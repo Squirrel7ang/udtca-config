@@ -1818,6 +1818,8 @@ def run_mode(mode, args, run_dir):
         "node1": str(mode_dir / "node1"),
         "nets": {rank: parse_net_samples(mode_dir / f"net_node{rank}.csv")
                  for rank in (0, 1)},
+        # Megatron 只有在没有语料时才退回 --mock-data；有真实语料时 loss 和 polar 可比
+        "mock_data": mode == "megatron" and not _megatron_data_prefix(args),
         "timed_out": timed_out0 or timed_out1,
         "node1_died_early": False,
     }
@@ -1986,7 +1988,7 @@ def compare(rows):
             out.append(f"线上流量 跨机网卡（单步均摊）: megatron={_fmt_gb(nmg / 1e9)}GB  "
                        f"polar={_fmt_gb(nm / 1e9)}GB  "
                        f"降低={_fmt_gb((nmg - nm) / 1e9)}GB ({nmg / nm:.2f}x)")
-        if mg.get("final_loss_node0") is not None:
+        if mg.get("final_loss_node0") is not None and mg.get("mock_data"):
             out.append("  （Megatron 用 --mock-data 跑，loss 与 polar 的真实数据不可比，"
                        "这里只比时间和通信）")
     if not out:
