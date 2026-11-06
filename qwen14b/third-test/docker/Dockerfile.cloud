@@ -49,6 +49,11 @@ RUN pip install --no-build-isolation --no-index --no-deps -e /workspace/udtca/po
  && python -c "import psgd, bitscom; \
 print('psgd:', psgd.__file__); print('bitscom:', bitscom.__file__)"
 
+# polar 的 fineweb token 缓存（480 blocks × seq256）：镜像离线运行，
+# polar 起手会按 samplesN=max_steps×micro_batches 找缓存，找不到就去连
+# HF —— 离线模式下必然失败。缓存文件名带节点标签，所以两台镜像各烤一份。
+COPY ctx/polar-cache /workspace/udtca/experiments/qwen14b/cache
+
 # Qwen2.5 tokenizer 的 HF 缓存（Megatron 的 HuggingFaceTokenizer 要用）：
 # 烤进镜像 + 关掉联网解析，运行期不依赖宿主机的 ~/.cache/huggingface 或 hf-mirror。
 COPY ctx/hf-cache /workspace/hf-cache

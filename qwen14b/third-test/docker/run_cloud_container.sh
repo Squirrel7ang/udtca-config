@@ -17,7 +17,6 @@ docker run -d --name third-test \
   -v /data:/data \
   -v /usr/src:/usr/src \
   -v /etc/localtime:/etc/localtime:ro \
-  -v /data1/tangruijing/third-test/cache:/workspace/udtca/experiments/qwen14b/cache \
   -e NCCL_SOCKET_IFNAME=ens120f0 \
   -e UDTCA_NODE0_IP=10.205.200.14 \
   -e UDTCA_NODE1_HOST=10.205.200.16 \

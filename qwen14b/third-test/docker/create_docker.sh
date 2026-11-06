@@ -87,6 +87,12 @@ for pat in ("*.bin", "*.idx"):
     if not got:
         bad("megatron 语料缺 %s" % pat)
 
+polar_cache = glob.glob(
+    "/workspace/udtca/experiments/qwen14b/cache/*_seq256_samples*_labels_unshifted_v2.pt")
+print("  polar token 缓存 %s" % (polar_cache or "缺失"))
+if not polar_cache:
+    bad("polar 数据集缓存缺失（离线模式连不上 HF，跑不起来）")
+
 snap = "/workspace/hf-cache/hub/models--Qwen--Qwen2.5-14B-Instruct/snapshots"
 print("  tokenizer 快照 %s" % ("在位" if os.path.isdir(snap) else "缺失"))
 if not os.path.isdir(snap):
