@@ -818,6 +818,8 @@ GPU_MEM_THRESHOLD_MIB = 256
 
 GPU_OCCUPANCY_SNIPPET = r"""
 THRESHOLD=__THRESHOLD__
+# 空=看全部卡；否则只看 --gpu-ids 点名的这几张（逗号分隔的物理 index）
+ALLOWED="__ALLOWED__"
 export LD_LIBRARY_PATH=/usr/local/corex/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
 SMI=""
@@ -831,20 +833,27 @@ if [ -z "$SMI" ]; then
 fi
 
 BUSY=$("$SMI" --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
-  | awk -F, -v t="$THRESHOLD" '{
-      gsub(/[ \t]/,"",$1); gsub(/[ \t]/,"",$2);
-      if ($1 != "" && $2+0 > t) printf "GPU%s(%sMiB) ", $1, $2 }')
-APPS=$("$SMI" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null \
-  | sed '/^[[:space:]]*$/d')
+  | awk -F, -v t="$THRESHOLD" -v allow="$ALLOWED" '
+      BEGIN { n = (allow == "") ? 0 : split(allow, a, ",") }
+      {
+        gsub(/[ \t]/,"",$1); gsub(/[ \t]/,"",$2);
+        if (n > 0) { ok = 0; for (i = 1; i <= n; i++) if (a[i] == $1) ok = 1; if (!ok) next }
+        if ($1 != "" && $2+0 > t) printf "GPU%s(%sMiB) ", $1, $2 }')
+# --query-compute-apps 不给 GPU index，没法按白名单过滤；点了名就只信显存这一路
+APPS=""
+if [ -z "$ALLOWED" ]; then
+  APPS=$("$SMI" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null \
+    | sed '/^[[:space:]]*$/d')
+fi
 
 if [ -n "$BUSY" ] || [ -n "$APPS" ]; then
-  echo "BUSY $SMI"
+  echo "BUSY $SMI${ALLOWED:+  (只看了 GPU $ALLOWED)}"
   [ -n "$BUSY" ] && echo "  超过 ${THRESHOLD}MiB 的卡: $BUSY"
   [ -n "$APPS" ] && { echo "  正在跑的进程:"; echo "$APPS" | cut -c1-200 | sed 's/^/    /'; }
   exit 1
 fi
 
-echo "FREE $SMI"
+echo "FREE $SMI${ALLOWED:+  (只看了 GPU $ALLOWED)}"
 exit 0
 """
 
@@ -884,7 +893,9 @@ def _print_block(text, indent="      "):
 
 def check_card_occupancy(args, node):
     """在一台节点的容器里看卡有没有被占用。返回 'free' / 'busy' / 'unknown'。"""
-    snippet = GPU_OCCUPANCY_SNIPPET.replace("__THRESHOLD__", str(args.gpu_mem_threshold))
+    snippet = (GPU_OCCUPANCY_SNIPPET
+               .replace("__THRESHOLD__", str(args.gpu_mem_threshold))
+               .replace("__ALLOWED__", getattr(args, "gpu_ids", "") or ""))
     rc, out = _run_capture(_docker(node["host"], args.container, snippet))
     if rc == 0:
         print(f"    [OK  ] 空闲（{out.splitlines()[0] if out else 'FREE'}）")
