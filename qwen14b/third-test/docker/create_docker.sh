@@ -156,6 +156,7 @@ cat <<MSG
 
   python3 $DEPLOY_DIR/run_docker.py                   # polar vs torch-DDP baseline，各 20 iter
   python3 $DEPLOY_DIR/run_megatron.py                 # polar vs Megatron-Core baseline，各 10 iter
+  python3 $DEPLOY_DIR/run_megatron_pp.py              # Megatron DP=4 PP=2 TP=4、PP 跨机，20 iter
   python3 $DEPLOY_DIR/run_api.py                      # 起训练 + 实时指标 API（默认只跑 polar）
   python3 $DEPLOY_DIR/run_docker.py --preflight-only  # 只想先查卡/连通性
 MSG

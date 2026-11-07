@@ -15,19 +15,26 @@
 # 1. 建容器（云侧宿主机上跑，会顺带 ssh 到边侧建边侧的容器 + 两边自检）
 bash /data1/tangruijing/third-test/create_docker.sh
 
-# 2. 跑训练（三选一，都在云侧宿主机上跑）
+# 2. 跑训练（四选一，都在云侧宿主机上跑）
 python3 /data1/tangruijing/third-test/run_docker.py     # polar vs polar 的 baseline（torch DDP），各 20 iter
 python3 /data1/tangruijing/third-test/run_megatron.py   # polar vs Megatron-Core baseline，各 10 iter
+python3 /data1/tangruijing/third-test/run_megatron_pp.py # Megatron DP=4 PP=2 TP=4、PP 跨机，20 iter
 python3 udtca-config/qwen14b/third-test/run_api.py      # 从仓库目录起：训练 + 实时指标 API（默认只跑 polar）
 ```
 
-三个脚本的分工：
+四个脚本的分工：
 
 | 脚本 | 默认 modes | 默认步数 | 说明 |
 |---|---|---|---|
 | `run_api.py` | polar | 跟入口脚本（默认 20） | 在 `run_docker.py` 之上挂 `/api/v1/*` 实时指标 API（从仓库目录运行，需 `qwen14b/metrics_api.py`） |
 | `run_docker.py` | `polar,baseline` | 20 | baseline = polar 的 torch-DDP 对照，不跑 Megatron |
 | `run_megatron.py` | `polar,megatron` | 10 | baseline = Megatron-Core；复用 `run_docker.py` 的实现，只是默认值不同 |
+| `run_megatron_pp.py` | `megatron` | 20 | Megatron `DP=4 PP=2 TP=4`，**PP 跨机**（`--megatron-pp-cross-node`）；默认开 dist-opt + sequence-parallel，加 `--modes polar,megatron` 才带 polar |
+
+`run_megatron.py` 切分是 `--pp 8 --tp 2`，加 `--use-tp-pp-dp-mapping` → rank 顺序
+`tp-cp-ep-pp-dp`，**DP 跨机**；`run_megatron_pp.py` 不传该参数，用 Megatron 默认的
+`tp-cp-ep-dp-pp`，pp 在最外层 → stage 0 在第一台、stage 1 在第二台，**PP 跨机**，
+TP/DP 留在单机内。两种切分对跨机网络用法不同（DP 梯度 all-reduce vs PP 的 P2P 流水）。
 
 `run_megatron.py` 起训前会在**两台机器上各单进程预构建一次 GPTDataset 索引缓存**
 （缓存目录是容器内本地盘，只有 global rank 0 建的那份另一台读不到，node1 的 building
@@ -35,7 +42,8 @@ rank 会并发重建并撞 `FileNotFoundError`；预热后所有 rank 都是 cac
 缓存 key 随 `--max-steps`/`--micro-batches`/`--seq-len`/`--seed` 变化，脚本会自动重建。
 
 `run_docker.py` / `run_megatron.py` 默认 16 卡/节点、双机 32 卡（`--gpus 16 --pp 8 --tp 2`
-→ DP=2 跨机），开跑前做全卡健康检查（`--skip-card-check` 才会跳过）。日志落
+→ DP=2 跨机）；`run_megatron_pp.py` 同样 32 卡，但 `--pp 2 --tp 4` → DP=4 单机内、PP 跨机。
+三个入口开跑前都做全卡健康检查（`--skip-card-check` 才会跳过）。日志落
 `/data1/tangruijing/third-test/run_log/xnode_<ts>/`。
 
 ## 镜像里有什么
