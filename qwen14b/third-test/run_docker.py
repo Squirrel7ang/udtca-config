@@ -239,7 +239,7 @@ export MEGATRON_RT_TAG="node@@rank@@"
 cat > "$CASE_DIR/PRE_RUN.md" <<PRE
 # PRE_RUN @@ts@@
 - mode=megatron(baseline) node_rank=@@rank@@/2 master=@@master_addr@@:@@master_port@@
-- GPUs=@@gpus@@ PP=@@pp@@ TP=@@tp@@ DP=@@dp@@（--use-tp-pp-dp-mapping，DP 跨机）
+- GPUs=@@gpus@@ PP=@@pp@@ TP=@@tp@@ DP=@@dp@@（@@mapping_label@@）
 - steps=@@max_steps@@ global_batch=@@gbs@@（=micro_batches × DP）seq_len=@@seq_len@@ seed=@@seed@@
 - runtime=$MG_RUNTIME
 - dist_opt=@@dist_opt_label@@
@@ -301,7 +301,7 @@ torchrun \
   --attention-backend unfused \
   --tensor-model-parallel-size @@tp@@ \
   --pipeline-model-parallel-size @@pp@@ \
-  --use-tp-pp-dp-mapping \
+  @@mapping_args@@ \
   @@data_args@@ \
   @@grad_reduce_args@@ \
   --no-gradient-accumulation-fusion \
@@ -612,16 +612,26 @@ def prepare_megatron_data(args):
 
 
 def _megatron_dp_gbs(args):
-    """DP 永远是跨机那一路；gbs = micro_batches × DP（索引缓存的 num_samples 由它决定）。"""
+    """dp = 2×gpus // (pp×tp)；gbs = micro_batches × dp（索引缓存的 num_samples 由它决定）。
+
+    哪一路跨机由 mapping 决定：默认加 --use-tp-pp-dp-mapping 时顺序为 tp-cp-ep-pp-dp，
+    DP 在最外层⇒DP 跨机；加 --megatron-pp-cross-node 时用 Megatron 默认顺序
+    tp-cp-ep-dp-pp，PP 在最外层⇒PP 跨机（DP 退到单机内）。
+    """
     dp = max((2 * args.gpus) // max(args.pp * args.tp, 1), 1)
     return dp, args.micro_batches * dp
 
 
+def _megatron_pp_cross_node(args):
+    return bool(getattr(args, "megatron_pp_cross_node", False))
+
+
 def _megatron_build_values(rank, args, case_dir, ts):
-    """Megatron mode 的占位符取值（DP 永远是跨机那一路：--use-tp-pp-dp-mapping）。"""
+    """Megatron mode 的占位符取值。"""
     dp, gbs = _megatron_dp_gbs(args)
     dist_opt = list(getattr(args, "megatron_dist_opt_args", []) or [])
     extra = shlex.split(getattr(args, "megatron_extra_args", "") or "")
+    pp_cross = _megatron_pp_cross_node(args)
     return {
         "mode": "megatron",
         "rank": rank,
@@ -638,6 +648,12 @@ def _megatron_build_values(rank, args, case_dir, ts):
         "pp": args.pp,
         "tp": args.tp,
         "dp": dp,
+        # 不加 --use-tp-pp-dp-mapping 时用 Megatron 默认 rank 顺序 tp-cp-ep-dp-pp，
+        # PP 是最外层维度 ⇒ stage 0 全在第一台、stage 1 全在第二台，即 PP 跨机。
+        "mapping_args": "" if pp_cross else "--use-tp-pp-dp-mapping",
+        "mapping_label": "默认顺序 tp-cp-ep-dp-pp，PP 跨机；TP/DP 在单机内"
+        if pp_cross
+        else "--use-tp-pp-dp-mapping，DP 跨机",
         "gbs": gbs,
         "max_steps": args.max_steps,
         "seq_len": args.seq_len,
@@ -2076,6 +2092,10 @@ def make_arg_parser(default_modes="polar,baseline", default_max_steps=20,
                    help="梯度 all-reduce 用 fp32（--bf16 在 Megatron 里的默认行为）。"
                         "默认不用：默认加 --grad-reduce-in-bf16，和 polar 的 bf16 all-reduce 同口径；"
                         "fp32 会让跨机字节数翻倍，Megatron 被人为拖慢")
+    p.add_argument("--megatron-pp-cross-node", action="store_true",
+                   help="不加 --use-tp-pp-dp-mapping，改用 Megatron 默认 rank 顺序 tp-cp-ep-dp-pp；"
+                        "PP 是最外层维度，所以 PP 跨机（stage 0 在第一台、stage 1 在第二台），"
+                        "TP/DP 留在单机内。默认不加：DP 跨机（pp 内层），PP=8 时 PP 也在单机内")
     p.add_argument("--megatron-extra-args", default="",
                    help='额外透传给 Megatron 的参数（整串，如 "--recompute-granularity full"）')
     p.add_argument("--net-if0", default=None,
@@ -2183,7 +2203,9 @@ def main(default_modes="polar,baseline", default_max_steps=20, baseline_mode="ba
     print(f"跨机训练  modes={modes}  steps={args.max_steps}  "
           f"GPUS={args.gpus}/节点 DP={2 * args.gpus // (args.pp * args.tp)} "
           f"PP={args.pp} TP={args.tp}  "
-          f"profiler=关闭（强制）")
+          + ("PP 跨机  " if "megatron" in modes and _megatron_pp_cross_node(args)
+             else "DP 跨机  " if "megatron" in modes else "")
+          + f"profiler=关闭（强制）")
     if args.enable_profiler:
         print("提示：--enable-profiler 已废弃，profiler 在 Corex 上会卡死整机，本次仍按关闭执行")
     print(f"  node0 {NODES[0]['name']}(本机) {NODES[0]['ip']}   "
