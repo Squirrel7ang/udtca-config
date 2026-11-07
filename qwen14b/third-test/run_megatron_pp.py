@@ -26,16 +26,19 @@ activation/梯度点对点（P2P）流水。对比「DP 跨机 vs PP 跨机」�
 
     --use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather
         （distributed optimizer；梯度 reduce 与参数 all-gather 与反传重叠）
-    --sequence-parallel（TP 的 all-reduce 按 sequence 切开，少一半通信量）
     --log-throughput（每步打 per-GPU 吞吐）
 
-刻意**没开**的（这个栈上没验证过，失败代价是整轮 20 iter 白跑）：
+刻意**没开**的（这个栈上用不了 / 没验证过）：
 
-    --use-flash-attn        已知能跑的是 --attention-backend unfused，flash-attn 与它冲突
-    --tp-comm-overlap       需要 userbuffers / CUDA graph，Corex 上没跑通过
-    --recompute-*           省显存但变慢，PP=2/TP=4 每卡只放 24 层，用不着
-    需要就透传：--megatron-extra-args "--use-flash-attn"
-    （注意 --megatron-extra-args 整串覆盖，自己写全，别和上面的 --sequence-parallel 打架）
+    --sequence-parallel       **用不了**：--transformer-impl local 的 RMSNorm 走
+                              WrappedTorchNorm，Megatron 直接断言
+                              "sequence parallel not supported by torch LayerNorm"
+                              （2026-11-07 实测，32 卡全部 rank 起跑即崩）
+    --use-flash-attn          已知能跑的是 --attention-backend unfused，flash-attn 与它冲突
+    --tp-comm-overlap         需要 userbuffers / CUDA graph，Corex 上没跑通过
+    --recompute-*             省显存但变慢，PP=2/TP=4 每卡只放 24 层，用不着
+    需要就透传：--megatron-extra-args "--recompute-granularity full"
+    （整串覆盖，自己写全）
 
 其余默认与 `run_megatron.py` 一致：`--grad-reduce-in-bf16`（与 polar 同口径）、
 NCCL 固定 Socket/Ring/Simple、起训前两台各自预构建 GPTDataset 索引缓存
@@ -57,7 +60,8 @@ DEFAULTS = [
     "--tp", "4",
     "--megatron-pp-cross-node",
     "--megatron-dist-opt",
-    "--megatron-extra-args", "--sequence-parallel --log-throughput",
+    # 值本身以 "--" 开头，必须用 = 形式，否则 argparse 会把它当成另一个选项
+    "--megatron-extra-args=--log-throughput",
 ]
 
 

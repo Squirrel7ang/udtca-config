@@ -29,12 +29,15 @@ python3 udtca-config/qwen14b/third-test/run_api.py      # 从仓库目录起：�
 | `run_api.py` | polar | 跟入口脚本（默认 20） | 在 `run_docker.py` 之上挂 `/api/v1/*` 实时指标 API（从仓库目录运行，需 `qwen14b/metrics_api.py`） |
 | `run_docker.py` | `polar,baseline` | 20 | baseline = polar 的 torch-DDP 对照，不跑 Megatron |
 | `run_megatron.py` | `polar,megatron` | 10 | baseline = Megatron-Core；复用 `run_docker.py` 的实现，只是默认值不同 |
-| `run_megatron_pp.py` | `megatron` | 20 | Megatron `DP=4 PP=2 TP=4`，**PP 跨机**（`--megatron-pp-cross-node`）；默认开 dist-opt + sequence-parallel，加 `--modes polar,megatron` 才带 polar |
+| `run_megatron_pp.py` | `megatron` | 20 | Megatron `DP=4 PP=2 TP=4`，**PP 跨机**（`--megatron-pp-cross-node`）；默认开 dist-opt + log-throughput，加 `--modes polar,megatron` 才带 polar |
 
 `run_megatron.py` 切分是 `--pp 8 --tp 2`，加 `--use-tp-pp-dp-mapping` → rank 顺序
 `tp-cp-ep-pp-dp`，**DP 跨机**；`run_megatron_pp.py` 不传该参数，用 Megatron 默认的
 `tp-cp-ep-dp-pp`，pp 在最外层 → stage 0 在第一台、stage 1 在第二台，**PP 跨机**，
 TP/DP 留在单机内。两种切分对跨机网络用法不同（DP 梯度 all-reduce vs PP 的 P2P 流水）。
+`--sequence-parallel` 在这套栈上用不了（`--transformer-impl local` 的 RMSNorm 走
+`WrappedTorchNorm`，Megatron 直接断言 "sequence parallel not supported by torch LayerNorm"），
+所以默认关。
 
 `run_megatron.py` 起训前会在**两台机器上各单进程预构建一次 GPTDataset 索引缓存**
 （缓存目录是容器内本地盘，只有 global rank 0 建的那份另一台读不到，node1 的 building
